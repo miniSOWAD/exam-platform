@@ -11,3 +11,4 @@ PyJWT==2.10.1
 pymupdf==1.25.5
 pytesseract==0.3.13
 Pillow==11.1.0
+cloudinary==1.44.1
