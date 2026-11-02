@@ -4,14 +4,37 @@ services:
     runtime: docker
     dockerfilePath: ./backend/Dockerfile
     dockerContext: ./backend
+    healthCheckPath: /api/v1/health
     envVars:
-      - key: ENVIRONMENT
+      - key: APP_NAME
+        value: ExamFlow API
+      - key: APP_ENV
         value: production
       - key: DATABASE_URL
         sync: false
-      - key: SECRET_KEY
+      - key: JWT_SECRET
         generateValue: true
-      - key: FRONTEND_ORIGINS
+      - key: ACCESS_TOKEN_MINUTES
+        value: "720"
+      - key: CORS_ORIGINS
         sync: false
       - key: COOKIE_SECURE
         value: "true"
+      - key: DB_POOL_SIZE
+        value: "2"
+      - key: DB_MAX_OVERFLOW
+        value: "1"
+      - key: DB_POOL_RECYCLE_SECONDS
+        value: "300"
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: CLOUDINARY_FOLDER
+        value: examflow
+      - key: MAX_UPLOAD_BYTES
+        value: "307200"
+      - key: ALLOWED_IMAGE_TYPES
+        value: image/jpeg,image/png,image/webp,image/jpg
