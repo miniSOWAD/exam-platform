@@ -32,6 +32,26 @@ class PermissionGrant(Base):
     active: Mapped[bool]=mapped_column(Boolean, default=True)
     __table_args__=(UniqueConstraint("moderator_id","code"),)
 
+class SiteProfile(Base):
+    __tablename__="site_profile"
+    id: Mapped[str]=mapped_column(String(20), primary_key=True, default="main")
+    owner_name: Mapped[str]=mapped_column(String(160), default="Md Mahruf Alam")
+    owner_role: Mapped[str]=mapped_column(String(220), default="Owner · Tutor · Examiner")
+    owner_bio: Mapped[str]=mapped_column(Text, default="I created ExamFlow to make exam preparation, assessment and performance tracking more organized and accessible.")
+    owner_education: Mapped[str]=mapped_column(String(220), default="")
+    owner_department: Mapped[str]=mapped_column(String(220), default="")
+    owner_institution: Mapped[str]=mapped_column(String(220), default="")
+    owner_location: Mapped[str]=mapped_column(String(160), default="")
+    owner_photo_url: Mapped[str]=mapped_column(String(1000), default="")
+    owner_email: Mapped[str]=mapped_column(String(255), default="")
+    owner_social_links: Mapped[dict]=mapped_column(JSON, default=dict)
+    announcement: Mapped[str]=mapped_column(String(300), default="A calmer space for focused exam preparation")
+    hero_eyebrow: Mapped[str]=mapped_column(String(160), default="EXAMINATION PREPARATION, REIMAGINED")
+    hero_title: Mapped[str]=mapped_column(String(220), default="Prepare with purpose.")
+    hero_highlight: Mapped[str]=mapped_column(String(220), default="Perform with confidence.")
+    hero_description: Mapped[str]=mapped_column(Text, default="A thoughtful workspace for creating exams, practicing what matters and understanding every result across Mathematics, Physics, Chemistry and Biology.")
+    updated_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=now, onupdate=now)
+
 class Exam(Base):
     __tablename__="exams"
     id: Mapped[str]=mapped_column(String(36), primary_key=True, default=uid)
@@ -45,6 +65,8 @@ class Exam(Base):
     status: Mapped[ExamStatus]=mapped_column(Enum(ExamStatus), default=ExamStatus.draft, index=True)
     access_mode: Mapped[str]=mapped_column(String(30), default="all_students")
     duration_seconds: Mapped[int]=mapped_column(Integer, default=3600)
+    scheduled_start_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True), nullable=True)
+    scheduled_end_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True), nullable=True)
     max_attempts: Mapped[int]=mapped_column(Integer, default=1)
     pass_marks: Mapped[float]=mapped_column(Float, default=0)
     started_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True), nullable=True)
@@ -82,6 +104,7 @@ class Attempt(Base):
     exam_id: Mapped[str]=mapped_column(ForeignKey("exams.id"), index=True)
     student_id: Mapped[str]=mapped_column(ForeignKey("users.id"), index=True)
     attempt_number: Mapped[int]=mapped_column(Integer, default=1)
+    pause_seconds_at_start: Mapped[int]=mapped_column(Integer, default=0)
     status: Mapped[str]=mapped_column(String(30), default="in_progress", index=True)
     started_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=now)
     submitted_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True), nullable=True)

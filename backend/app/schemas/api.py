@@ -1,5 +1,6 @@
 from pydantic import BaseModel, EmailStr, Field, ConfigDict
 from typing import Literal, Any
+from datetime import datetime
 
 class RegisterIn(BaseModel):
     email: EmailStr
@@ -28,6 +29,8 @@ class ExamIn(BaseModel):
     declared_question_count: int | None = Field(default=None, ge=0, le=10000)
     source_file_name: str | None = Field(default=None, max_length=255)
     duration_seconds: int = Field(default=3600, ge=60, le=86400)
+    scheduled_start_at: datetime | None = None
+    scheduled_end_at: datetime | None = None
     max_attempts: int = Field(default=1, ge=1, le=20)
     pass_marks: float = Field(default=0, ge=0)
     access_mode: Literal["all_students","selected_students"] = "all_students"
@@ -60,3 +63,28 @@ class PDFCreateExamIn(BaseModel):
     max_attempts: int = Field(default=1, ge=1, le=20)
     publish_immediately: bool = False
     source_file_name: str | None = Field(default=None, max_length=255)
+
+
+class SiteProfileIn(BaseModel):
+    owner_name: str = Field(default="Md Mahruf Alam", min_length=2, max_length=160)
+    owner_role: str = Field(default="Owner · Tutor · Examiner", max_length=220)
+    owner_bio: str = Field(default="", max_length=5000)
+    owner_education: str = Field(default="", max_length=220)
+    owner_department: str = Field(default="", max_length=220)
+    owner_institution: str = Field(default="", max_length=220)
+    owner_location: str = Field(default="", max_length=160)
+    owner_photo_url: str = Field(default="", max_length=1000)
+    owner_email: str = Field(default="", max_length=255)
+    owner_social_links: dict[str, str] = Field(default_factory=dict)
+    announcement: str = Field(default="", max_length=300)
+    hero_eyebrow: str = Field(default="EXAMINATION PREPARATION, REIMAGINED", max_length=160)
+    hero_title: str = Field(default="Prepare with purpose.", max_length=220)
+    hero_highlight: str = Field(default="Perform with confidence.", max_length=220)
+    hero_description: str = Field(default="", max_length=3000)
+
+class ExamScheduleIn(BaseModel):
+    scheduled_start_at: datetime | None = None
+    scheduled_end_at: datetime | None = None
+
+class ExtendTimeIn(BaseModel):
+    additional_minutes: int = Field(ge=1, le=1440)
