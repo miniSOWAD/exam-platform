@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: examflow-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: FRONTEND_ORIGINS
+        sync: false
+      - key: COOKIE_SECURE
+        value: "true"
