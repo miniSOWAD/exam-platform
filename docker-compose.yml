@@ -5,7 +5,8 @@ services:
       POSTGRES_DB: examdb
       POSTGRES_USER: examuser
       POSTGRES_PASSWORD: localdevpassword
-    volumes: [postgres_data:/var/lib/postgresql/data]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U examuser -d examdb"]
       interval: 5s
@@ -13,21 +14,27 @@ services:
       retries: 10
   api:
     build: ./backend
-    environment:
-      DATABASE_URL: postgresql+psycopg://examuser:localdevpassword@db:5432/examdb
-      FRONTEND_ORIGINS: http://localhost:3000
-      SECRET_KEY: local-development-secret-change-before-deploy-please-123456789
-      COOKIE_SECURE: "false"
-    ports: ["8000:8000"]
+    env_file:
+      - ./backend/.env
+    ports:
+      - "8000:8000"
     depends_on:
-      db: {condition: service_healthy}
+      db:
+        condition: service_healthy
   web:
-    build: ./frontend
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: /api/v1
+        NEXT_PUBLIC_SITE_URL: http://localhost:3000
+        API_INTERNAL_URL: http://api:8000
     environment:
       NEXT_PUBLIC_API_URL: /api/v1
       API_INTERNAL_URL: http://api:8000
       NEXT_PUBLIC_SITE_URL: http://localhost:3000
-    ports: ["3000:3000"]
-    depends_on: [api]
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
 volumes:
   postgres_data:

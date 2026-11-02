@@ -1,6 +1,8 @@
 # ExamFlow — Full-stack online examination platform
 
-A deployable starter platform built with Next.js + TypeScript and FastAPI. It includes authentication, student self-registration, one-time Admin bootstrap, permission-grant scaffolding for moderators, exam creation APIs, question management APIs, live exam state controls, answer persistence, automatic objective scoring, leaderboard publication, and a reviewed PDF-to-exam import workflow that extracts subject, chapter, set, duration, question text and MCQ options using Bengali/English OCR.
+**Project version:** 1.2.0
+
+A deployable starter platform built with Next.js + TypeScript and FastAPI. It now supports Cloudinary-backed profile photos for all signed-in account roles, a strict 300 KiB image limit, and Neon PostgreSQL deployment with a small connection pool. It includes authentication, student self-registration, one-time Admin bootstrap, permission-grant scaffolding for moderators, exam creation APIs, question management APIs, live exam state controls, answer persistence, automatic objective scoring, leaderboard publication, and a reviewed PDF-to-exam import workflow that extracts subject, chapter, set, duration, question text and MCQ options using Bengali/English OCR.
 
 > This is a functional MVP foundation, not a fully audited high-stakes examination product. Read **Known limitations** before using it for a real exam.
 
@@ -14,7 +16,7 @@ A deployable starter platform built with Next.js + TypeScript and FastAPI. It in
 
 ## Run locally with Docker
 
-1. Copy `backend/.env.example` to `backend/.env` and set a strong `SECRET_KEY`.
+1. Copy `backend/.env.example` to `backend/.env`, add Cloudinary credentials, and replace `JWT_SECRET` with a new random secret. The sample file defaults to the local Docker database; use the Neon pooled connection string for cloud deployment.
 2. From this directory run:
 
    ```bash
@@ -43,7 +45,7 @@ pip install -r requirements.txt
 # Linux: install the Bengali and English OCR language packs
 sudo apt-get install -y tesseract-ocr tesseract-ocr-ben tesseract-ocr-eng
 cp .env.example .env
-# Set DATABASE_URL and SECRET_KEY in .env
+# Set DATABASE_URL, JWT_SECRET and Cloudinary values in .env
 alembic upgrade head
 python -m app.seed_admin
 uvicorn app.main:app --reload --port 8000
@@ -75,16 +77,19 @@ Configure the frontend environment:
 - `NEXT_PUBLIC_API_URL=/api/v1`
 - `API_INTERNAL_URL=https://your-api-host.example`
 
-`API_INTERNAL_URL` is used by Next.js rewrites to proxy `/api/v1/*` to FastAPI. This keeps browser requests same-origin and allows the API's HttpOnly cookie to be set on the frontend domain. If you deploy frontend and API on different origins without the proxy, configure cookie SameSite/Secure and CSRF protection correctly before production.
+`API_INTERNAL_URL` is used by Next.js rewrites to proxy `/api/v1/*` to FastAPI and to server-render the public owner/site content into the initial page HTML (cached for 60 seconds). This keeps browser requests same-origin and allows the API's HttpOnly cookie to be set on the frontend domain. If you deploy frontend and API on different origins without the proxy, configure cookie SameSite/Secure and CSRF protection correctly before production.
 
 Configure the backend environment:
 
-- `ENVIRONMENT=production`
-- `DATABASE_URL=postgresql+psycopg://...`
-- `SECRET_KEY=<long-random-secret>`
-- `FRONTEND_ORIGINS=https://your-domain.example`
+- `APP_ENV=production`
+- `DATABASE_URL=postgresql+psycopg://...` (Neon pooled URL; plain `postgresql://` is also normalized)
+- `JWT_SECRET=<new-long-random-secret>`
+- `CORS_ORIGINS=https://your-domain.example`
 - `COOKIE_SECURE=true`
-- `MAX_UPLOAD_MB=15`
+- `DB_POOL_SIZE=2` and `DB_MAX_OVERFLOW=1`
+- `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`
+- `CLOUDINARY_FOLDER=examflow`
+- `MAX_UPLOAD_BYTES=307200`
 
 Run database migrations before serving traffic:
 
@@ -128,11 +133,14 @@ All routes are under `/api/v1`.
 | Area | Routes |
 |---|---|
 | Health | `GET /health` |
+| Public site content | `GET /site/content`, Admin-only `PUT /site/content`, `POST /site/content/owner-avatar` |
+| Public exam discovery | `GET /public/exams` |
 | Auth | `POST /auth/register`, `POST /auth/login`, `POST /auth/logout`, `GET /auth/me` |
-| Users | `GET /users`, `POST /admin/moderators` |
+| Users | `GET /users`, `POST /admin/moderators`, `POST /users/me/avatar`, `DELETE /users/me/avatar` |
 | Moderator permissions | `PUT /moderators/{id}/permissions` |
 | Exams | `POST /exams`, `GET /exams`, `GET /exams/{id}`, `POST /exams/{id}/publish` |
 | Live controls | `POST /exams/{id}/control/start|pause|resume|end` |
+| Schedule and duration | `PATCH /exams/{id}/schedule`, `POST /exams/{id}/extend-time` |
 | Questions | `POST /exams/{id}/questions`, `GET /exams/{id}/questions`, `GET /exams/{id}/questions/manage`, `PATCH /exams/{id}/questions/{question_id}` |
 | Access | `POST /exams/{id}/access` |
 | Attempts | `POST /exams/{id}/attempts`, `GET /attempts/{id}`, `PUT /attempts/{id}/answers/{question_id}`, `POST /attempts/{id}/submit` |
@@ -170,7 +178,7 @@ The backend Docker image installs Tesseract and Bengali/English language data. F
 The current MVP intentionally keeps dependencies and resource usage low. Before using it for consequential/high-stakes exams, implement and test:
 
 - Full immutable exam-version snapshots and per-attempt question snapshots (the current schema has a simplified question model).
-- Server-authoritative pause-aware deadline calculations. The starter pause/resume control updates state but its attempt deadline handling needs a dedicated timer service before production.
+- Production timer orchestration and automatic forced submission at deadline. Attempt reads calculate remaining time on the server, pause/resume is pause-aware, and student clients synchronize every 15 seconds. Scheduled start is a guard for Admin's manual start action; automatic scheduled start/end jobs are not included.
 - WebSocket event fan-out using Redis for multiple API instances; live events are not yet wired into the API.
 - Autosave retry queue, idempotency keys and optimistic concurrency for answer writes.
 - Correct partial-credit/negative-marking policy and manual short-answer grading workflow.
@@ -186,15 +194,30 @@ Do not assume the project is suitable for 500 concurrent users until a realistic
 
 The homepage has been redesigned using the supplied academic portfolio UI as its visual reference. It now has a left academic profile rail, a central ExamFlow introduction with Mathematics/Physics/Chemistry/Biology subject chips, a live/upcoming exam panel, a month calendar, a published-results leaderboard, and a feature overview. The palette uses warm ivory, pale mint, soft blue and muted teal with editorial serif headings and restrained CSS-only decorative artwork. See `docs/FRONTEND-REDESIGN.md` for the layout, API behavior and current integration boundaries.
 
-The profile card uses the signed-in user's initials because the current backend user schema does not provide profile photos. The calendar shows the current month but does not invent university exam dates: the existing exam API has no scheduled-start field yet. Live/upcoming exams and leaderboard data are fetched only for authenticated users, and the homepage does not poll continuously.
+The left profile rail is the site owner's public profile, independent of whichever student or moderator is signed in. The Admin edits it from Dashboard → Manage website. Signed-in users get their own initials/profile control in the top-right navigation. The calendar marks dates from Admin-managed exam schedules. Public homepage exam discovery returns only exams configured for all students; authenticated users see their permitted exam list. The homepage does not poll continuously.
 
 
-## Owner profile, site content and scheduling (v1.1)
+## Site owner profile and admin-managed website content
 
-- The homepage left rail is the fixed ExamFlow owner profile (default: Md Mahruf Alam), not the currently signed-in visitor.
-- Admins can edit the owner biography, education, institution, contact details, social links, owner photo URL, announcement ribbon and hero copy at `/dashboard/site-profile`.
-- The header displays the signed-in user's own avatar/initials menu with dashboard and sign-out actions. This account menu is separate from the fixed site-owner profile.
-- Live exam screens re-sync the server timer every 30 seconds so extensions and pause/resume changes are reflected without frequent polling. Each attempt stores its pause baseline so pauses before a student starts do not add unintended time.
-- Admins can schedule draft/published examinations with `PUT /api/v1/exams/{id}/schedule` and extend an upcoming/live/paused exam with `POST /api/v1/exams/{id}/extend-time`.
-- New database migrations: `0003_site_profile_exam_schedule` and `0004_attempt_pause_baseline`. Run `alembic upgrade head` before deploying the updated backend.
-- New moderator permissions: `exam.schedule` and `exam.extend_time`. The Admin always has these permissions.
+The public left-hand profile rail is the site owner's profile, not the signed-in user's profile. Its default owner is **Md Mahruf Alam — Site Owner · Tutor & Examiner**. Students and moderators do not replace this information with their own accounts. Authenticated users instead get an account/profile control in the top-right navigation.
+
+The Admin can edit the public site from **Dashboard → Manage website** (`/dashboard/site-content`). Editable content includes the brand name, top ribbon, homepage headline and description (which also feed the dynamic page title/description metadata), call-to-action labels, owner name/designation/biography/education/institution/photo URL/email/phone/social links/expertise, subject labels, homepage section headings and descriptions, feature cards, and footer text. The Admin can set the owner photo URL or upload a JPG, PNG or WebP image directly to Cloudinary (300 KiB maximum).
+
+## Exam scheduling and time extensions
+
+Open an exam in the Admin/Moderator dashboard and choose **Schedule & timing**. Draft and upcoming (`published`) exams can be assigned or rescheduled with a start and optional end date/time. The backend blocks an early manual start when a future start time is set. For upcoming, live, or paused exams, authorized staff can add minutes to the exam duration. For live exams the student client synchronizes its remaining time from the server every 15 seconds, so an extension appears on the next sync. If an exam end date is set, extending the duration also moves that end date by the same amount.
+
+The latest migration is `0004_user_avatars_cloudinary`; the Docker startup command runs `alembic upgrade head`.
+
+
+## User profile photos (Cloudinary)
+
+Every authenticated student, moderator and Admin can upload or remove their own account photo from **Dashboard → My profile**. Uploads are limited to 300 KiB (307,200 bytes) and accept JPG/JPEG, PNG and WebP only. The backend validates the real image format and dimensions; it does not trust the filename or browser MIME header alone. The image is uploaded server-side to Cloudinary and the database stores only the transformed delivery URL and Cloudinary public ID. Profile URLs are delivered using a 512×512 crop and automatic format/quality optimization. The permanent site-owner portrait can also be uploaded by the Admin from **Dashboard → Manage website**.
+
+The Cloudinary API secret must remain in FastAPI environment variables and must never be prefixed with `NEXT_PUBLIC_`. Copy `backend/.env.example` to `backend/.env` and fill in the Cloudinary credentials.
+
+## Neon and FastAPI cloud deployment
+
+See [`docs/DEPLOY-NEON-RENDER-CLOUDINARY.md`](docs/DEPLOY-NEON-RENDER-CLOUDINARY.md) for the Neon pooled connection URL format, Render Docker deployment, Cloudinary environment variables, Admin bootstrap, Vercel proxy configuration, and quota-saving settings. A ready-to-configure Render Blueprint is included in `render.yaml`; the FastAPI Dockerfile runs Alembic migrations before Uvicorn.
+
+**Credential warning:** Never deploy credentials copied from a previously shared `.env` file. Rotate exposed database, Cloudinary, JWT, mail and Admin secrets before using production.
