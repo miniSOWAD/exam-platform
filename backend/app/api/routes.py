@@ -6,13 +6,13 @@ import jwt, fitz, re
 from app.core.database import get_db
 from app.core.security import hash_password, verify_password, create_token, decode_token
 from app.core.config import settings
-from app.models.entities import User, Role, Exam, ExamStatus, Question, Attempt, AccessGrant, PermissionGrant, HistoricalResult
-from app.schemas.api import RegisterIn, LoginIn, UserOut, ExamIn, QuestionIn, AnswerIn, GrantIn, PermissionIn, PDFCreateExamIn
+from app.models.entities import User, Role, Exam, ExamStatus, Question, Attempt, AccessGrant, PermissionGrant, HistoricalResult, SiteProfile
+from app.schemas.api import RegisterIn, LoginIn, UserOut, ExamIn, QuestionIn, AnswerIn, GrantIn, PermissionIn, PDFCreateExamIn, SiteProfileIn, ExamScheduleIn, ExtendTimeIn
 from app.services.pdf_exam_parser import parse_exam_pdf
 from fastapi import Request
 
 router=APIRouter()
-PERMISSIONS={"exam.create","exam.update","exam.delete","exam.publish","exam.start","exam.pause","exam.resume","exam.end","exam.live_edit","question.manage","student.read","student.manage","student.import","results.read","results.import","analytics.read","moderator.manage","audit.read"}
+PERMISSIONS={"exam.create","exam.update","exam.delete","exam.publish","exam.start","exam.pause","exam.resume","exam.end","exam.live_edit","question.manage","student.read","student.manage","student.import","results.read","results.import","analytics.read","moderator.manage","audit.read","exam.schedule","exam.extend_time"}
 
 def current_user(request: Request, db: Session=Depends(get_db)):
     token=request.cookies.get("access_token")
@@ -51,6 +51,40 @@ def answer_key_missing(question: Question) -> bool:
     if question.kind == "short_answer":
         return not any(str(x).strip() for x in (key.get("accepted_answers") or []))
     return True
+
+DEFAULT_SITE_PROFILE = {
+    "owner_name": "Md Mahruf Alam", "owner_role": "Owner · Tutor · Examiner",
+    "owner_bio": "I created ExamFlow to make exam preparation, assessment and performance tracking more organized and accessible.",
+    "owner_education": "", "owner_department": "", "owner_institution": "", "owner_location": "",
+    "owner_photo_url": "", "owner_email": "", "owner_social_links": {},
+    "announcement": "A calmer space for focused exam preparation",
+    "hero_eyebrow": "EXAMINATION PREPARATION, REIMAGINED",
+    "hero_title": "Prepare with purpose.", "hero_highlight": "Perform with confidence.",
+    "hero_description": "A thoughtful workspace for creating exams, practicing what matters and understanding every result across Mathematics, Physics, Chemistry and Biology."
+}
+
+def site_profile_out(profile):
+    if not profile:
+        return DEFAULT_SITE_PROFILE
+    return {key: getattr(profile, key) for key in DEFAULT_SITE_PROFILE}
+
+@router.get("/site-profile")
+def get_site_profile(db: Session = Depends(get_db)):
+    profile = db.get(SiteProfile, "main")
+    return site_profile_out(profile)
+
+@router.put("/admin/site-profile")
+def update_site_profile(data: SiteProfileIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    if user.role != Role.admin:
+        raise HTTPException(403, "Only the site Admin can edit public site content")
+    profile = db.get(SiteProfile, "main")
+    if not profile:
+        profile = SiteProfile(id="main")
+        db.add(profile)
+    for key, value in data.model_dump().items():
+        setattr(profile, key, value)
+    db.commit(); db.refresh(profile)
+    return site_profile_out(profile)
 
 @router.post("/auth/register", response_model=UserOut, status_code=201)
 def register(data:RegisterIn, db:Session=Depends(get_db)):
@@ -111,10 +145,29 @@ def create_moderator(data:RegisterIn,db:Session=Depends(get_db),user:User=Depend
 @router.post("/exams",status_code=201)
 def create_exam(data:ExamIn,db:Session=Depends(get_db),user:User=Depends(current_user)):
     require(user,db,"exam.create")
+    if data.scheduled_start_at and data.scheduled_end_at:
+        start = data.scheduled_start_at if data.scheduled_start_at.tzinfo else data.scheduled_start_at.replace(tzinfo=timezone.utc)
+        end = data.scheduled_end_at if data.scheduled_end_at.tzinfo else data.scheduled_end_at.replace(tzinfo=timezone.utc)
+        if end <= start: raise HTTPException(422, "Scheduled end must be later than scheduled start")
     exam=Exam(**data.model_dump(),created_by=user.id); db.add(exam); db.commit(); db.refresh(exam); return exam_out(exam)
 
+def datetime_out(value):
+    if value is None: return None
+    if value.tzinfo is None: value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
+
 def exam_out(e):
-    return {"id":e.id,"title":e.title,"description":e.description,"subject":e.subject,"status":e.status.value,"access_mode":e.access_mode,"duration_seconds":e.duration_seconds,"max_attempts":e.max_attempts,"pass_marks":e.pass_marks,"chapter":e.chapter,"set_name":e.set_name,"declared_question_count":e.declared_question_count,"source_file_name":e.source_file_name,"question_count":len(e.questions)}
+    return {"id":e.id,"title":e.title,"description":e.description,"subject":e.subject,"status":e.status.value,"access_mode":e.access_mode,"duration_seconds":e.duration_seconds,"scheduled_start_at":datetime_out(e.scheduled_start_at),"scheduled_end_at":datetime_out(e.scheduled_end_at),"started_at":datetime_out(e.started_at),"paused_at":datetime_out(e.paused_at),"accumulated_pause_seconds":e.accumulated_pause_seconds,"max_attempts":e.max_attempts,"pass_marks":e.pass_marks,"chapter":e.chapter,"set_name":e.set_name,"declared_question_count":e.declared_question_count,"source_file_name":e.source_file_name,"question_count":len(e.questions)}
+
+@router.get("/public/exams")
+def list_public_exams(db: Session = Depends(get_db)):
+    """Return only published, all-student exams and safe schedule metadata for the public homepage."""
+    exams = (db.query(Exam)
+        .filter(Exam.status.in_([ExamStatus.published, ExamStatus.live, ExamStatus.paused]))
+        .filter(Exam.access_mode == "all_students")
+        .order_by(Exam.scheduled_start_at.asc().nullslast(), Exam.created_at.desc())
+        .limit(30).all())
+    return [exam_out(exam) for exam in exams]
 
 @router.get("/exams")
 def list_exams(db:Session=Depends(get_db),user:User=Depends(current_user)):
@@ -183,6 +236,12 @@ def control_exam(exam_id:str,action:str,db:Session=Depends(get_db),user:User=Dep
     if not e: raise HTTPException(404,"Exam not found")
     if expected and e.status!=expected: raise HTTPException(409,f"Cannot {action} exam in {e.status.value} state")
     now=datetime.now(timezone.utc)
+    if action=="start" and e.scheduled_start_at:
+        scheduled = e.scheduled_start_at if e.scheduled_start_at.tzinfo else e.scheduled_start_at.replace(tzinfo=timezone.utc)
+        if now < scheduled: raise HTTPException(409, "This examination is scheduled to start later")
+    if action=="start" and e.scheduled_end_at:
+        scheduled_end = e.scheduled_end_at if e.scheduled_end_at.tzinfo else e.scheduled_end_at.replace(tzinfo=timezone.utc)
+        if now >= scheduled_end: raise HTTPException(409, "The scheduled examination window has ended")
     if action=="start": e.status=ExamStatus.live; e.started_at=now
     elif action=="pause": e.status=ExamStatus.paused; e.paused_at=now
     elif action=="resume":
@@ -190,6 +249,37 @@ def control_exam(exam_id:str,action:str,db:Session=Depends(get_db),user:User=Dep
         e.paused_at=None; e.status=ExamStatus.live
     else: e.status=ExamStatus.ended; e.ended_at=now; e.paused_at=None
     db.commit(); return exam_out(e)
+
+@router.put("/exams/{exam_id}/schedule")
+def update_exam_schedule(exam_id: str, data: ExamScheduleIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    require(user, db, "exam.schedule")
+    exam = db.query(Exam).filter(Exam.id == exam_id).with_for_update().first()
+    if not exam: raise HTTPException(404, "Exam not found")
+    if exam.status not in (ExamStatus.draft, ExamStatus.published):
+        raise HTTPException(409, "Only draft or upcoming examinations can be rescheduled")
+    start, end = data.scheduled_start_at, data.scheduled_end_at
+    if start and end:
+        start_utc = start if start.tzinfo else start.replace(tzinfo=timezone.utc)
+        end_utc = end if end.tzinfo else end.replace(tzinfo=timezone.utc)
+        if end_utc <= start_utc: raise HTTPException(422, "Scheduled end must be later than scheduled start")
+    exam.scheduled_start_at = start
+    exam.scheduled_end_at = end
+    db.commit(); db.refresh(exam)
+    return exam_out(exam)
+
+@router.post("/exams/{exam_id}/extend-time")
+def extend_exam_time(exam_id: str, data: ExtendTimeIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    require(user, db, "exam.extend_time")
+    exam = db.query(Exam).filter(Exam.id == exam_id).with_for_update().first()
+    if not exam: raise HTTPException(404, "Exam not found")
+    if exam.status not in (ExamStatus.draft, ExamStatus.published, ExamStatus.live, ExamStatus.paused):
+        raise HTTPException(409, "Time can only be extended for upcoming or active examinations")
+    added = data.additional_minutes * 60
+    exam.duration_seconds += added
+    if exam.scheduled_end_at:
+        exam.scheduled_end_at = exam.scheduled_end_at + timedelta(seconds=added)
+    db.commit(); db.refresh(exam)
+    return {**exam_out(exam), "added_seconds": added, "message": f"Examination duration extended by {data.additional_minutes} minutes"}
 
 @router.post("/exams/{exam_id}/access")
 def grant_access(exam_id:str,data:GrantIn,db:Session=Depends(get_db),user:User=Depends(current_user)):
@@ -210,7 +300,7 @@ def start_attempt(exam_id:str,db:Session=Depends(get_db),user:User=Depends(curre
     if e.access_mode=="selected_students" and not db.query(AccessGrant).filter_by(exam_id=exam_id,student_id=user.id,active=True).first(): raise HTTPException(403,"Access not granted")
     count=db.query(Attempt).filter_by(exam_id=exam_id,student_id=user.id).count()
     if count>=e.max_attempts: raise HTTPException(409,"Attempt limit reached")
-    a=Attempt(exam_id=exam_id,student_id=user.id,attempt_number=count+1,max_score=sum(q.marks for q in e.questions)); db.add(a); db.commit(); db.refresh(a)
+    a=Attempt(exam_id=exam_id,student_id=user.id,attempt_number=count+1,pause_seconds_at_start=e.accumulated_pause_seconds,max_score=sum(q.marks for q in e.questions)); db.add(a); db.commit(); db.refresh(a)
     return {"attempt_id":a.id,"started_at":a.started_at,"duration_seconds":e.duration_seconds,"remaining_seconds":e.duration_seconds}
 
 @router.get("/attempts/{attempt_id}/questions")
@@ -224,7 +314,7 @@ def attempt_questions(attempt_id:str,db:Session=Depends(get_db),user:User=Depend
 def get_attempt(attempt_id:str,db:Session=Depends(get_db),user:User=Depends(current_user)):
     a=db.get(Attempt,attempt_id)
     if not a or (a.student_id!=user.id and user.role==Role.student): raise HTTPException(404,"Attempt not found")
-    return {"id":a.id,"exam_id":a.exam_id,"status":a.status,"answers":a.answers,"started_at":a.started_at,"submitted_at":a.submitted_at,"score":a.score}
+    return {"id":a.id,"exam_id":a.exam_id,"status":a.status,"answers":a.answers,"started_at":a.started_at,"submitted_at":a.submitted_at,"score":a.score,"pause_seconds_at_start":a.pause_seconds_at_start}
 
 @router.put("/attempts/{attempt_id}/answers/{question_id}")
 def save_answer(attempt_id:str,question_id:str,data:AnswerIn,db:Session=Depends(get_db),user:User=Depends(current_user)):
@@ -234,7 +324,7 @@ def save_answer(attempt_id:str,question_id:str,data:AnswerIn,db:Session=Depends(
     e=db.get(Exam,a.exam_id)
     if e.status!=ExamStatus.live: raise HTTPException(409,"Exam is not accepting answers")
     elapsed=(datetime.now(timezone.utc)-a.started_at.replace(tzinfo=timezone.utc) if a.started_at.tzinfo is None else datetime.now(timezone.utc)-a.started_at).total_seconds()
-    if elapsed-e.accumulated_pause_seconds>e.duration_seconds: raise HTTPException(409,"Time expired")
+    if elapsed-max(0,e.accumulated_pause_seconds-a.pause_seconds_at_start)>e.duration_seconds: raise HTTPException(409,"Time expired")
     q=db.query(Question).filter_by(id=question_id,exam_id=e.id).first()
     if not q: raise HTTPException(404,"Question not found")
     answers=list(a.answers or []); item=next((x for x in answers if x.get("question_id")==question_id),None)
