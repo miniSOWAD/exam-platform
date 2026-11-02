@@ -181,3 +181,20 @@ The current MVP intentionally keeps dependencies and resource usage low. Before 
 - Public result release policy and leaderboard privacy review.
 
 Do not assume the project is suitable for 500 concurrent users until a realistic load test passes on the actual hosting/database plan.
+
+## Frontend design update
+
+The homepage has been redesigned using the supplied academic portfolio UI as its visual reference. It now has a left academic profile rail, a central ExamFlow introduction with Mathematics/Physics/Chemistry/Biology subject chips, a live/upcoming exam panel, a month calendar, a published-results leaderboard, and a feature overview. The palette uses warm ivory, pale mint, soft blue and muted teal with editorial serif headings and restrained CSS-only decorative artwork. See `docs/FRONTEND-REDESIGN.md` for the layout, API behavior and current integration boundaries.
+
+The profile card uses the signed-in user's initials because the current backend user schema does not provide profile photos. The calendar shows the current month but does not invent university exam dates: the existing exam API has no scheduled-start field yet. Live/upcoming exams and leaderboard data are fetched only for authenticated users, and the homepage does not poll continuously.
+
+
+## Owner profile, site content and scheduling (v1.1)
+
+- The homepage left rail is the fixed ExamFlow owner profile (default: Md Mahruf Alam), not the currently signed-in visitor.
+- Admins can edit the owner biography, education, institution, contact details, social links, owner photo URL, announcement ribbon and hero copy at `/dashboard/site-profile`.
+- The header displays the signed-in user's own avatar/initials menu with dashboard and sign-out actions. This account menu is separate from the fixed site-owner profile.
+- Live exam screens re-sync the server timer every 30 seconds so extensions and pause/resume changes are reflected without frequent polling. Each attempt stores its pause baseline so pauses before a student starts do not add unintended time.
+- Admins can schedule draft/published examinations with `PUT /api/v1/exams/{id}/schedule` and extend an upcoming/live/paused exam with `POST /api/v1/exams/{id}/extend-time`.
+- New database migrations: `0003_site_profile_exam_schedule` and `0004_attempt_pause_baseline`. Run `alembic upgrade head` before deploying the updated backend.
+- New moderator permissions: `exam.schedule` and `exam.extend_time`. The Admin always has these permissions.
