@@ -24,3 +24,26 @@
 | WebSocket live fanout | No | Redis coordination required for production |
 | Email verification/password reset | No | Must be added before public launch |
 | Audit logs | Schema planning only | Not yet fully wired |
+
+## Owner profile, website content and scheduling additions
+
+| Capability | Current status | Access |
+|---|---|---|
+| Permanent public site-owner profile (Md Mahruf Alam by default) | Implemented | Public read; Admin edit |
+| Admin-managed brand, ribbon, hero, subjects, section copy, feature cards and footer | Implemented | Admin |
+| Owner education, institution, photo URL, email, phone and social links | Implemented | Public read; Admin edit |
+| Top-right signed-in user avatar/account menu | Implemented | Authenticated users |
+| Set/reschedule draft or upcoming exam start/end | Implemented | Admin / moderator with `exam.update` |
+| Prevent early manual start before scheduled start | Implemented | Backend enforced |
+| Extend duration of upcoming/live/paused exam | Implemented | `exam.update` for upcoming; `exam.live_edit` for live/paused |
+| Student server timer synchronization after extension | Implemented | Attempt owner |
+| Automatic scheduled start/end worker | Not included | Future enhancement |
+| Direct owner photo upload to object storage | Not included; use a public image URL | Future enhancement |
+
+| Feature | v1.2.0 status |
+|---|---|
+| Student/moderator/admin own profile photo | Implemented; Cloudinary; 300 KiB max |
+| Admin site-owner portrait upload | Implemented; Cloudinary; 300 KiB max |
+| JPG/JPEG, PNG and WebP validation | Implemented server-side |
+| Neon PostgreSQL pooled connection configuration | Implemented |
+| Render FastAPI Docker deployment blueprint | Included |
