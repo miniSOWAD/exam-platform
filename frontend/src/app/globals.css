@@ -244,28 +244,36 @@ button, input, textarea, select { font: inherit; }
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
 }
 
-
-/* Site owner identity and account menu */
-.owner-photo { object-fit: cover; }
-.owner-bio { text-align: left; margin-bottom: 14px; }
-.owner-details { margin-top: 12px; }
-.owner-social-links { display:flex; flex-wrap:wrap; gap:7px; margin-top:12px; }
-.owner-social-links a { border:1px solid #d9e8e8; border-radius:999px; padding:5px 9px; color:#527f8c; font-size:10px; font-weight:800; }
-.account-menu { position:relative; }
-.account-trigger { display:inline-flex; align-items:center; gap:8px; border:1px solid #dce8e9; border-radius:999px; background:#fff; padding:5px 10px 5px 5px; color:#42536b; font-size:12px; font-weight:800; }
-.account-avatar { display:grid; width:32px; height:32px; place-items:center; border-radius:50%; background:#e8f2f8; color:#416a9b; font-size:11px; font-weight:900; }
-.account-dropdown { position:absolute; top:calc(100% + 10px); right:0; z-index:60; width:230px; overflow:hidden; border:1px solid #dce8e9; border-radius:16px; background:#fffdfa; box-shadow:0 18px 45px rgba(30,55,70,.16); padding:7px; }
-.account-dropdown-user { display:flex; flex-direction:column; gap:3px; border-bottom:1px solid #edf1ef; padding:11px 10px 13px; }
-.account-dropdown-user strong { color:#17243b; font-size:13px; }
-.account-dropdown-user span { overflow:hidden; color:#8190a0; font-size:10px; text-overflow:ellipsis; }
-.account-dropdown-user small { color:#5e8f87; font-size:10px; font-weight:800; text-transform:capitalize; }
-.account-dropdown a,.account-dropdown button { display:flex; width:100%; align-items:center; gap:9px; border-radius:9px; padding:10px; color:#53647b; font-size:12px; font-weight:700; text-align:left; }
-.account-dropdown a:hover,.account-dropdown button:hover { background:#eff7f6; color:#365b78; }
-@media (max-width: 520px) { .account-name { display:none; } .owner-profile-card { padding-inline:16px; } }
-
-.calendar-days > span.calendar-event-day { position:relative; color:#4f907e; font-weight:900; box-shadow:inset 0 0 0 1px #a8d8c8; }
-.calendar-days > span.calendar-today.calendar-event-day { color:#fff; background:#365bd7; box-shadow:inset 0 0 0 2px #a8d8c8; }
-.calendar-event-list { display:flex; width:100%; flex-direction:column; gap:7px; margin-top:12px; }
-.calendar-event-list > div { display:flex; align-items:center; gap:9px; border-top:1px solid #dfecea; padding-top:8px; }
-.calendar-event-list span { flex:0 0 auto; border-radius:8px; background:#e7f4ef; padding:5px 7px; color:#558d79; font-size:9px; font-weight:900; }
-.calendar-event-list strong { overflow:hidden; color:#536a73; font-size:10px; text-overflow:ellipsis; white-space:nowrap; }
+/* Owner profile, authenticated header menu, and administrator-managed content */
+.home-grid { grid-template-columns: 270px minmax(0,1fr) 350px; }
+.owner-avatar { overflow: hidden; padding: 0; }
+.owner-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.owner-bio { margin-top: 16px; color: #718095; font-size: 11px; line-height: 1.8; text-align: left; }
+.owner-details { margin-top: 16px; }
+.owner-details > div { align-items: flex-start; }
+.owner-details strong { text-transform: none; }
+.owner-website-link { display: flex; align-items: center; justify-content: center; gap: 6px; margin-top: 12px; color: #5d8796; font-size: 10px; font-weight: 800; }
+.owner-socials { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 15px; }
+.owner-socials a { display: grid; width: 31px; height: 31px; place-items: center; border: 1px solid #dce9e9; border-radius: 50%; background: rgba(255,255,255,.8); color: #628b98; transition: transform .18s ease, background .18s ease; }
+.owner-socials a:hover { transform: translateY(-2px); background: #eaf6f4; }
+.owner-expertise-card { padding: 19px 17px 17px; background: linear-gradient(155deg,#fffdfa 0%,#f1f8f8 100%); }
+.owner-expertise-list { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 16px; }
+.owner-expertise-list span { border: 1px solid #deebeb; border-radius: 999px; background: rgba(255,255,255,.82); padding: 7px 9px; color: #5b7884; font-size: 9px; font-weight: 800; }
+.exam-schedule-meta { display: flex; align-items: center; gap: 5px; margin-top: 7px; color: #77929b; font-size: 9px; }
+.calendar-days > span.calendar-exam-day { position: relative; background: #e8f6f0; color: #4b9074; font-weight: 800; }
+.calendar-days > span.calendar-today.calendar-exam-day { background: var(--brand); color: white; }
+.calendar-days > span.calendar-exam-day::after { position: absolute; bottom: 3px; width: 4px; height: 4px; border-radius: 50%; background: #68a88b; content: ''; }
+.calendar-days > span.calendar-today.calendar-exam-day::after { background: white; }
+.site-footer { border-top: 1px solid #dce8e8; background: #fffdfa; padding: 27px 18px; color: #8292a0; text-align: center; font-size: 11px; }
+.header-user-menu { position: relative; }
+.header-profile-button { display: inline-flex; align-items: center; gap: 8px; border: 1px solid #dbe7e9; border-radius: 999px; background: rgba(255,255,255,.86); padding: 5px 11px 5px 5px; color: #40536b; font-size: 12px; font-weight: 800; }
+.header-profile-avatar { display: grid; width: 31px; height: 31px; flex: 0 0 31px; place-items: center; overflow: hidden; border-radius: 50%; background: #365bd7; color: white; font-size: 11px; font-weight: 900; }
+.header-profile-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.header-profile-popover { position: absolute; top: calc(100% + 10px); right: 0; z-index: 50; width: 210px; overflow: hidden; border: 1px solid #dce8e8; border-radius: 16px; background: #fffdfa; padding: 8px; box-shadow: 0 18px 44px rgba(23,36,59,.14); }
+.header-popover-user { display: flex; flex-direction: column; gap: 3px; padding: 10px 11px 12px; border-bottom: 1px solid #edf1ef; }
+.header-popover-user strong { overflow: hidden; color: #26384f; font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.header-popover-user span { color: #8a99a7; font-size: 10px; text-transform: capitalize; }
+.header-profile-popover a, .header-profile-popover button { display: flex; width: 100%; align-items: center; gap: 9px; border: 0; border-radius: 9px; background: transparent; padding: 10px 11px; color: #566a7e; text-align: left; font-size: 11px; font-weight: 700; cursor: pointer; }
+.header-profile-popover a:hover, .header-profile-popover button:hover { background: #eef7f5; color: #386e78; }
+@media (max-width: 1280px) { .home-grid { grid-template-columns: 220px minmax(0,1fr); } }
+@media (max-width: 760px) { .owner-profile-card { width: 100%; } .header-profile-button { padding-right: 6px; } }
