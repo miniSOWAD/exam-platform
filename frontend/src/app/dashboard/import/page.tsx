@@ -25,6 +25,7 @@ type Preview = {
   filename: string;
   pages: number;
   ocr_used: boolean;
+  ocr_engine?: string;
   metadata: {
     subject: string | null;
     chapter: string | null;
@@ -133,7 +134,7 @@ export default function ImportExamPage() {
 
     {preview && <>
       <section className="card mt-6 p-5 md:p-7">
-        <div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="text-xl font-black">2. Review detected exam information</h2><p className="mt-1 text-sm text-slate-500">{preview.filename} · {preview.pages} pages · {preview.ocr_used ? 'Bengali/English OCR used' : 'Embedded text extracted'}</p></div><span className="rounded-full bg-emerald-50 px-3 py-1.5 text-xs font-bold text-emerald-700"><CheckCircle2 className="mr-1 inline" size={14}/>{preview.question_count_detected} questions detected</span></div>
+        <div className="flex flex-wrap items-center justify-between gap-3"><div><h2 className="text-xl font-black">2. Review detected exam information</h2><p className="mt-1 text-sm text-slate-500">{preview.filename} · {preview.pages} pages · {preview.ocr_used ? `OCR used${preview.ocr_engine ? ` · ${preview.ocr_engine}` : ''}` : 'Embedded text extracted'}</p></div><span className="rounded-full bg-emerald-50 px-3 py-1.5 text-xs font-bold text-emerald-700"><CheckCircle2 className="mr-1 inline" size={14}/>{preview.question_count_detected} questions detected</span></div>
         {preview.warnings.length > 0 && <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-4"><p className="font-bold text-amber-900"><AlertTriangle className="mr-2 inline" size={16}/>Review required</p><ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-amber-900">{preview.warnings.map((w, i) => <li key={i}>{w}</li>)}</ul></div>}
         <div className="mt-5 grid gap-4 md:grid-cols-2">
           <label className="text-sm font-bold">Exam title<input className="field mt-2 font-normal" value={title} onChange={(e) => setTitle(e.target.value)}/></label>

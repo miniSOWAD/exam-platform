@@ -1,36 +1,51 @@
-"""Low-cost PDF exam parser: PyMuPDF text extraction plus local Tesseract OCR.
+"""Layout-aware PDF exam extraction for Bengali/English question papers.
 
-Bangla PDFs often use legacy embedded fonts whose Unicode text layer is corrupt.
-For Bengali documents we OCR rendered pages to recover readable Bangla text.
-Extracted answers are never guessed; the answer key stays empty unless supplied.
+The parser handles two-column papers, Bengali option labels (ক/খ/গ/ঘ),
+question numbers split onto their own OCR line, and PDFs whose embedded
+Unicode text layer is unreliable. Local Tesseract is preferred. FastAPI Cloud
+can use OCR.Space Engine 3 when Tesseract or Bengali language data is absent.
+Correct answers are never inferred.
 """
 from __future__ import annotations
 
 import re
 import shutil
 import unicodedata
+from io import BytesIO
 from typing import Any
 
 import fitz
-import httpx
 import pytesseract
+import httpx
 from PIL import Image
-from io import BytesIO
 
 BENGALI_RE = re.compile(r"[\u0980-\u09FF]")
 BN_DIGITS = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
-QUESTION_MARKER_RE = re.compile(
-    r"^\s*(?P<token>[০-৯0-9]{1,3}|[>vVbBdD][a-zA-Z0-9]{0,2})\s*[.,।)]\s+(?P<body>\S.*)$"
+QUESTION_WITH_BODY_RE = re.compile(
+    r"^\s*(?P<number>[০-৯0-9]{1,3})\s*[.।)]\s*(?P<body>\S.*)$"
 )
+QUESTION_NUMBER_ONLY_RE = re.compile(r"^\s*(?P<number>[০-৯0-9]{1,3})\s*[.।)]?\s*$")
+# Parenthesized Bengali labels are the normal form in Bangladeshi exam papers.
+# The generic one/two-character label also catches common OCR confusions such as
+# (A), (1), (*) and (|). Chemical state labels like H2O(g) are not matched
+# because the opening parenthesis is not preceded by whitespace.
 OPTION_MARKER_RE = re.compile(
-    r"(?<!\S)(?:(?P<letter>[A-D])\s*[.,)]\s*|(?P<digit>[0-4][০-৯]?|[০-৯])\s*[.,)]{1,2}\s+|(?P<ocr>[\[|])\s*[.)]{1,2}\s+)",
-    re.IGNORECASE,
+    r"(?<!\S)[(（\[]\s*(?P<label>[^\s()（）\[\]]{1,2})\s*[)）\]]\s*"
 )
+OPTION_BARE_MARKER_RE = re.compile(r"^\s*(?:[€£@])?\s*(?P<label>[কখগঘ](?:ে)?|[A-Da-d1-4])\s*[)৷।.]\s*", re.IGNORECASE)
+
+
+class OCRUnavailableError(RuntimeError):
+    """No Bengali-capable OCR engine is configured for this deployment."""
+
+
+class OCRServiceError(RuntimeError):
+    """The configured external OCR provider failed."""
 
 
 def _clean(value: str) -> str:
     value = unicodedata.normalize("NFC", value or "")
-    value = value.replace("\x0c", " ").replace("\u200b", "")
+    value = value.replace("\x0c", " ").replace("\u200b", "").replace("\ufeff", "")
     return re.sub(r"[ \t]+", " ", value).strip()
 
 
@@ -50,15 +65,22 @@ def _metadata(text: str) -> dict[str, Any]:
         chapter = first[chapter_start.start():].strip(" _—–-:")
         subject = first[:chapter_start.start()].strip(" _—–-:")
 
-    set_match = re.search(r"(?:সেট|\bset)\s*([০-৯0-9A-Za-z]+)", second, re.IGNORECASE)
-    set_name = f"সেট {set_match.group(1)}" if set_match and "সেট" in set_match.group(0) else (f"Set {set_match.group(1)}" if set_match else None)
-    exam_title = second
+    # Search the whole header, not just the second line: OCR can split the
+    # university title and the set label across separate lines.
+    set_match = re.search(r"(?:সেট|\bset)\s*([০-৯0-9A-Za-z]+)", text, re.IGNORECASE)
+    set_name = None
     if set_match:
-        exam_title = re.split(r"(?:সেট|\bset)\s*", second, maxsplit=1, flags=re.IGNORECASE)[0].strip(" _—–-:")
-    exam_title = exam_title.replace("বিশৃবিদ্যালয়", "বিশ্ববিদ্যালয়").replace("বিশৃবিদ্যালয়", "বিশ্ববিদ্যালয়")
+        token = _ascii_digits(set_match.group(1))
+        set_name = f"সেট {set_match.group(1)}" if "সেট" in set_match.group(0) else f"Set {set_match.group(1)}"
+
+    exam_title = second or None
+    if exam_title and set_match:
+        exam_title = re.split(r"(?:সেট|\bset)\s*", exam_title, maxsplit=1, flags=re.IGNORECASE)[0].strip(" _—–-:")
+    if exam_title:
+        exam_title = exam_title.replace("বিশৃবিদ্যালয়", "বিশ্ববিদ্যালয়").replace("বিশৃবিদ্যালয়", "বিশ্ববিদ্যালয়")
 
     count_match = re.search(r"(?:মোট\s*প্রশ্ন|total\s+questions|no\.?\s+of\s+questions)\s*[:：]?\s*([০-৯0-9]+)", text, re.IGNORECASE)
-    duration_match = re.search(r"(?:সময়|time)\s*[:：]?\s*([০-৯0-9]+)\s*(?:মিনিট|minutes?|mins?)", text, re.IGNORECASE)
+    duration_match = re.search(r"(?:সময়|সময়|time)\s*[:：]?\s*([০-৯0-9]+)\s*(?:মিনিট|minutes?|mins?)", text, re.IGNORECASE)
     marks_match = re.search(r"(?:পূর্ণমান|মোট\s*নম্বর|মোট\s*মার্ক|full\s+marks|total\s+marks|maximum\s+marks)\s*[:：]?\s*([০-৯0-9]+)", text, re.IGNORECASE)
 
     return {
@@ -72,224 +94,438 @@ def _metadata(text: str) -> dict[str, Any]:
     }
 
 
-def _looks_like_option_line(line: str) -> bool:
+def _question_marker(line: str) -> tuple[int, str | None] | None:
+    match = QUESTION_WITH_BODY_RE.match(line)
+    if match:
+        number = int(_ascii_digits(match.group("number")))
+        body = _clean(match.group("body"))
+        return number, body or None
+    match = QUESTION_NUMBER_ONLY_RE.match(line)
+    if match:
+        return int(_ascii_digits(match.group("number"))), None
+    return None
+
+
+def _option_segments(line: str) -> list[str]:
+    """Split one OCR line into option texts, supporting Bengali option labels."""
     matches = list(OPTION_MARKER_RE.finditer(line))
-    if len(matches) >= 2:
-        return True
-    return bool(re.match(r"^\s*[A-D]\s*[.,)]", line, re.IGNORECASE))
+    if not matches:
+        bare = OPTION_BARE_MARKER_RE.match(line)
+        if bare:
+            value = _clean(line[bare.end():]).strip(" ,;|")
+            return [value] if value else [""]
+        return []
+
+    # A single parenthesized marker is an option only when it starts the line.
+    if len(matches) == 1 and matches[0].start() > 1:
+        return []
+
+    values: list[str] = []
+    for index, marker in enumerate(matches):
+        start = marker.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(line)
+        value = _clean(line[start:end]).strip(" ,;|")
+        values.append(value)
+    return values
 
 
-def _question_marker(line: str, expected_number: int | None = None) -> tuple[int | None, str] | None:
-    if _looks_like_option_line(line):
-        return None
-    match = QUESTION_MARKER_RE.match(line)
-    if not match:
-        return None
-    token = _ascii_digits(match.group("token"))
-    number = int(token) if token.isdigit() else None
-    body = _clean(match.group("body"))
-    if len(body) < 5:
-        return None
-    # OCR often reads B/C/D option labels as 3/0/1. Those single-digit
-    # markers are treated as question numbers only when they match the
-    # next expected number in sequence.
-    if number is not None and number <= 4 and expected_number is not None and number != expected_number:
-        return None
-    return number, body
+def _is_question_like_continuation(line: str) -> bool:
+    if len(line) < 12:
+        return False
+    return bool(re.search(r"[?？]|কোনটি|কোন\s|কত\??|কী\??|কেন\??|বিক্রিয়ায়|বিক্রিয়ায়", line, re.IGNORECASE))
 
 
-def _extract_options_and_prompt(lines: list[str]) -> tuple[str, list[dict[str, str]], list[str]]:
-    prompt_lines: list[str] = []
-    options: list[dict[str, str]] = []
-    warnings: list[str] = []
+def _parse_column_candidates(text: str) -> list[dict[str, Any]]:
+    """Parse one column's OCR text into question candidates before numbering."""
+    candidates: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+    pending_number: int | None = None
     option_mode = False
 
-    for raw_line in lines:
-        line = _clean(raw_line)
-        if not line:
-            continue
-        matches = list(OPTION_MARKER_RE.finditer(line))
-        is_option_line = bool(matches) and (len(matches) >= 2 or bool(re.match(r"^\s*(?:[A-D]|[0-4][০-৯]?|[০-৯])\s*[.,)]", line, re.IGNORECASE)) or option_mode)
-
-        if is_option_line:
-            option_mode = True
-            for index, marker in enumerate(matches):
-                start = marker.end()
-                end = matches[index + 1].start() if index + 1 < len(matches) else len(line)
-                option_text = _clean(line[start:end]).strip(" ,;|")
-                if option_text:
-                    key = chr(ord("A") + len(options))
-                    if len(options) < 4:
-                        options.append({"key": key, "text": option_text})
-                    else:
-                        options[-1]["text"] += " " + option_text
-            continue
-
-        if option_mode and options:
-            # OCR may wrap an option onto a continuation line.
-            options[-1]["text"] = _clean(options[-1]["text"] + " " + line)
-        else:
-            prompt_lines.append(line)
-
-    prompt = _clean(" ".join(prompt_lines))
-    if len(options) == 1:
-        warnings.append("Only one option was detected; check the OCR result and question type.")
-    if len(options) == 0:
-        warnings.append("No options detected. Confirm this is a short-answer question or repair the OCR text.")
-    if len(options) == 3:
-        warnings.append("Only three options were detected; check whether an option was missed by OCR.")
-    if len(options) > 4:
-        warnings.append("More than four option fragments were detected; check the OCR result.")
-    return prompt, options, warnings
-
-
-def _parse_question_pages(page_texts: list[str], declared_count: int | None) -> list[dict[str, Any]]:
-    questions: list[dict[str, Any]] = []
-    current_number = 0
-    current_lines: list[str] = []
+    def start(number: int | None, body: str | None = None) -> None:
+        nonlocal current, option_mode
+        current = {"raw_number": number, "prompt_lines": [body] if body else [], "options": []}
+        option_mode = False
 
     def flush() -> None:
-        nonlocal current_lines, current_number
-        if not current_lines:
-            return
-        prompt, options, warnings = _extract_options_and_prompt(current_lines)
-        if prompt:
-            kind = "mcq" if len(options) >= 2 else "short_answer"
-            if len(options) == 2 and re.search(r"সত্য|মিথ্যা|true|false", " ".join(x["text"] for x in options), re.IGNORECASE):
-                kind = "true_false"
-            elif len(options) == 2:
-                warnings.append("Only two options were detected; verify whether additional options are missing.")
-            questions.append({
-                "number": current_number or len(questions) + 1,
-                "kind": kind,
-                "prompt": prompt,
-                "options": options,
-                "answer_key": {},
-                "marks": 1,
-                "negative_marks": 0,
-                "confidence": 0.80 if len(prompt) > 12 and len(options) == 4 else (0.62 if len(options) == 3 else 0.45),
-                "needs_review": True,
-                "answer_key_missing": True,
-                "warnings": warnings,
-            })
-        current_lines = []
+        nonlocal current, option_mode
+        if current is not None:
+            prompt = _clean(" ".join(current["prompt_lines"]))
+            options = [_clean(x) for x in current["options"] if _clean(x)]
+            # A stray OCR token such as "৯২৮" followed by one detached option
+            # is not a usable question block. Drop it rather than shifting all
+            # subsequent question numbers.
+            if len(prompt) >= 3:
+                candidates.append({"raw_number": current["raw_number"], "prompt": prompt, "options": options})
+        current = None
+        option_mode = False
 
-    for page_text in page_texts:
-        lines = [_clean(line) for line in page_text.splitlines()]
-        lines = [line for line in lines if line]
-        first_marker_index = None
-        for i, line in enumerate(lines):
-            candidate = _question_marker(line, current_number + 1 if current_number else None)
-            if candidate:
-                first_marker_index = i
-                break
-        if first_marker_index is None:
+    lines = [_clean(line) for line in text.splitlines()]
+    for line in lines:
+        if not line:
             continue
 
-        first_on_page = True
-        for line in lines[first_marker_index:]:
-            expected = current_number + 1 if current_number else 1
-            marker = _question_marker(line, expected)
-            if marker:
+        marker = _question_marker(line)
+        if marker:
+            flush()
+            number, body = marker
+            if body is None:
+                pending_number = number
+            else:
+                start(number, body)
+                pending_number = None
+            continue
+
+        if pending_number is not None:
+            # A number was OCR'd on its own line; the next non-option line is
+            # the question stem. This is common with Bengali numerals.
+            segments = _option_segments(line)
+            if segments:
+                start(pending_number, None)
+                pending_number = None
+            else:
+                start(pending_number, line)
+                pending_number = None
+                continue
+
+        segments = _option_segments(line)
+        if segments:
+            if current is None:
+                # Ignore detached options until a question stem/number appears.
+                continue
+            option_mode = True
+            for segment in segments:
+                if len(current["options"]) < 4:
+                    current["options"].append(segment)
+                elif current["options"]:
+                    current["options"][-1] = _clean(current["options"][-1] + " " + segment)
+            continue
+
+        if current is None:
+            continue
+
+        if option_mode and current["options"]:
+            if len(current["options"]) >= 4 and _is_question_like_continuation(line):
+                # Rescue a question number/stem that OCR missed after the
+                # previous question's four options.
                 flush()
-                detected_number, body = marker
-                if first_on_page:
-                    if detected_number and detected_number > current_number and detected_number <= (declared_count or 1000):
-                        current_number = detected_number
-                    else:
-                        current_number = current_number + 1 if current_number else 1
-                    first_on_page = False
-                else:
-                    # Within a page use sequential numbering; OCR occasionally
-                    # confuses a question number with a unit or option label.
-                    current_number += 1
-                current_lines = [body]
-            elif current_lines:
-                current_lines.append(line)
-        flush()
+                start(None, line)
+            else:
+                current["options"][-1] = _clean(current["options"][-1] + " " + line)
+        else:
+            current["prompt_lines"].append(line)
 
-    for i, question in enumerate(questions):
-        if i and question["number"] != questions[i - 1]["number"] + 1:
-            question["warnings"].append("Question numbering is not consecutive; verify page boundaries and OCR.")
-    return questions
+    flush()
+    return candidates
 
 
-class PDFOCRUnavailableError(RuntimeError):
-    """Raised when a scanned/legacy-font PDF needs OCR but no OCR engine is configured."""
+def _normalise_candidate_numbers(candidates: list[dict[str, Any]], expected_start: int, declared_count: int | None) -> list[dict[str, Any]]:
+    if not candidates:
+        return []
+    # A column normally contains 6-8 questions. A marker far outside this
+    # local window is much more likely to be OCR noise than a real number.
+    upper = expected_start + 12
+    raw_numbers = [c.get("raw_number") for c in candidates]
+    valid = [n if isinstance(n, int) and expected_start <= n <= upper else None for n in raw_numbers]
+    result: list[dict[str, Any]] = []
+
+    for index, candidate in enumerate(candidates):
+        number = valid[index]
+        previous = next((valid[j] for j in range(index - 1, -1, -1) if valid[j] is not None), None)
+        following = next((valid[j] for j in range(index + 1, len(valid)) if valid[j] is not None), None)
+
+        if number is None:
+            # Recover a number that OCR omitted only when the surrounding
+            # recognized numbers leave exactly one slot for this candidate.
+            if previous is not None and following is not None and following == previous + 2:
+                number = previous + 1
+            elif previous is None and following == expected_start + 1:
+                number = expected_start
+            elif previous is not None and following is None and index == len(candidates) - 1:
+                number = previous + 1
+            elif previous is None and following is None and len(candidates) == 1:
+                number = expected_start
+            else:
+                # Do not invent a sequential question for an unanchored OCR
+                # fragment; that can duplicate the preceding question and
+                # shift every later number.
+                continue
+        elif previous is not None and following is not None and following == previous + 2 and number != previous + 1:
+            # Typical Bengali OCR confusion: e.g. ১১ is read as ৯৯ between ১০ and ১২.
+            number = previous + 1
+
+        if result and number <= result[-1]["number"]:
+            # Drop duplicate/out-of-order OCR fragments instead of renumbering
+            # them into a new, incorrect question.
+            continue
+
+        result.append({"number": number, "prompt": candidate.get("prompt", ""), "options": candidate.get("options", [])})
+    return result
 
 
-class PDFOCRServiceError(RuntimeError):
-    """Raised when the configured remote OCR provider cannot process a PDF."""
+def _candidate_quality(question: dict[str, Any]) -> float:
+    prompt = question.get("prompt", "")
+    options = question.get("options", [])
+    all_text = prompt + " " + " ".join(options)
+    bengali_count = len(BENGALI_RE.findall(all_text))
+    alnum_count = sum(ch.isalnum() for ch in all_text)
+    return len(prompt) + min(len(options), 4) * 35 + bengali_count * 0.35 + min(alnum_count, 300) * 0.05
 
 
-def _native_text_is_usable(native_text: str) -> bool:
-    """Avoid OCR when PyMuPDF already extracted readable, numbered question text.
+def _merge_candidate_sets(candidate_sets: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    merged: dict[int, dict[str, Any]] = {}
+    for candidates in candidate_sets:
+        for candidate in candidates:
+            number = candidate["number"]
+            existing = merged.get(number)
+            if existing is None:
+                merged[number] = candidate
+                continue
+            best = candidate if _candidate_quality(candidate) > _candidate_quality(existing) else existing
+            other = existing if best is candidate else candidate
+            best_options = best.get("options", [])
+            other_options = other.get("options", [])
+            # Preserve option order. When one OCR pass found more options, use
+            # that complete list; index-by-index merging can shift B/C/D when
+            # the other pass missed option B.
+            if len(other_options) > len(best_options):
+                best_options = other_options
+            elif len(other_options) == len(best_options):
+                best_options = [
+                    a if len(a) >= len(b) else b
+                    for a, b in zip(best_options, other_options)
+                ]
+            prompt = best.get("prompt", "")
+            if len(other.get("prompt", "")) > len(prompt):
+                prompt = other["prompt"]
+            merged[number] = {"number": number, "prompt": prompt, "options": best_options[:4]}
+    return [merged[number] for number in sorted(merged)]
 
-    Bengali text PDFs frequently have a perfectly usable Unicode text layer. The old
-    implementation OCRed every Bengali PDF, unnecessarily requiring the Tesseract
-    executable on FastAPI Cloud. We only OCR when the text layer is blank/too short or
-    Bengali text exists but no question block can be recognized from it.
-    """
-    if len((native_text or '').strip()) < 40:
-        return False
-    has_bengali = bool(BENGALI_RE.search(native_text))
-    marker_count = sum(1 for line in native_text.splitlines() if _question_marker(_clean(line)))
-    if has_bengali and marker_count == 0:
-        return False
-    return marker_count > 0
+
+def _column_rectangles(page: fitz.Page) -> list[fitz.Rect]:
+    width, height = page.rect.width, page.rect.height
+    divider_x = None
+    for drawing in page.get_drawings():
+        for item in drawing.get("items", []):
+            if item[0] == "re":
+                rect = item[1]
+                if rect.height > height * 0.08 and rect.width < 4 and abs(rect.x0 - width / 2) < width * 0.12:
+                    divider_x = (rect.x0 + rect.x1) / 2
+                    break
+            elif item[0] == "l":
+                a, b = item[1], item[2]
+                if abs(a.x - b.x) < 2 and abs(a.y - b.y) > height * 0.08 and abs(a.x - width / 2) < width * 0.12:
+                    divider_x = a.x
+                    break
+        if divider_x is not None:
+            break
+
+    if divider_x is None:
+        return [fitz.Rect(22, 22, width - 22, height - 28)]
+    return [
+        fitz.Rect(22, 22, divider_x - 5, height - 28),
+        fitz.Rect(divider_x + 5, 22, width - 22, height - 28),
+    ]
 
 
-def _local_tesseract_ready() -> bool:
-    """Return true only if the Tesseract binary and Bengali + English data are present."""
-    if not shutil.which('tesseract'):
+def _render(page: fitz.Page, rect: fitz.Rect, dpi: int) -> Image.Image:
+    pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), clip=rect, alpha=False)
+    return Image.open(BytesIO(pix.tobytes("png"))).convert("RGB")
+
+
+def _tesseract_ready() -> bool:
+    if not shutil.which("tesseract"):
         return False
     try:
-        languages = set(pytesseract.get_languages(config=''))
-        return {'ben', 'eng'}.issubset(languages)
+        languages = set(pytesseract.get_languages(config=""))
+        return "ben" in languages and "eng" in languages
     except Exception:
         return False
 
 
-def _ocr_with_tesseract(document: fitz.Document, dpi: int) -> list[str]:
-    texts: list[str] = []
-    for page in document:
-        pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), alpha=False)
-        with Image.open(BytesIO(pix.tobytes('png'))) as image:
-            texts.append(pytesseract.image_to_string(image, lang='ben+eng', config='--oem 1 --psm 3'))
-    return texts
+def _ocr_tesseract(image: Image.Image, psm: int) -> str:
+    return pytesseract.image_to_string(image, lang="ben+eng", config=f"--oem 1 --psm {psm}")
 
 
-def _ocr_with_ocr_space(raw: bytes, filename: str, api_key: str, engine: int, timeout: int) -> list[str]:
-    """Optional cloud OCR fallback. The PDF is sent to OCR.Space only when configured."""
-    try:
-        response = httpx.post(
-            'https://api.ocr.space/parse/image',
-            headers={'apikey': api_key},
-            data={
-                'filetype': 'PDF',
-                'OCREngine': str(engine),
-                'isOverlayRequired': 'false',
-                'scale': 'true',
-            },
-            files={'file': (filename or 'question-paper.pdf', raw, 'application/pdf')},
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        payload = response.json()
-    except (httpx.HTTPError, ValueError) as exc:
-        raise PDFOCRServiceError('The configured OCR service could not be reached. Please retry or check the OCR service configuration.') from exc
+def _prepend_missing_first_question(text: str, page: fitz.Page, rect: fitz.Rect, expected_start: int, dpi: int) -> str:
+    existing = [_question_marker(_clean(line)) for line in text.splitlines()]
+    if any(marker and marker[0] == expected_start for marker in existing):
+        return text
+    # OCR engines sometimes skip the first stem at the top of a column while
+    # still reading its four options. Re-read a narrow top strip to recover it.
+    strip = fitz.Rect(rect.x0, rect.y0, rect.x1, min(rect.y0 + 95, rect.y1))
+    if strip.height < 20:
+        return text
+    top_text = _ocr_tesseract(_render(page, strip, max(dpi, 300)), 11)
+    for line in top_text.splitlines():
+        marker = _question_marker(_clean(line))
+        if marker and marker[0] == expected_start:
+            return line + "\n" + text
+    return text
 
-    if payload.get('IsErroredOnProcessing'):
-        error = payload.get('ErrorMessage') or payload.get('ErrorDetails') or 'OCR provider rejected the document.'
-        if isinstance(error, list):
-            error = '; '.join(str(item) for item in error)
-        raise PDFOCRServiceError(f'OCR service error: {str(error)[:300]}')
 
-    parsed = payload.get('ParsedResults') or []
-    page_texts = [str(item.get('ParsedText') or '') for item in parsed]
-    if not page_texts or not any(text.strip() for text in page_texts):
-        raise PDFOCRServiceError('The OCR service returned no readable text for this PDF.')
-    return page_texts
+def _ocr_local_columns(document: fitz.Document, dpi: int, declared_count: int | None) -> tuple[list[str], str]:
+    page_texts: list[str] = []
+    expected_start = 1
+    for page_index, page in enumerate(document):
+        columns = _column_rectangles(page)
+        # Metadata is read from the first-page header separately; question
+        # crops start lower to avoid mixing the header with the two columns.
+        for column_index, rect in enumerate(columns):
+            y0 = 90 if page_index == 0 else 25
+            if page_index == 0 and len(columns) == 2 and column_index == 1:
+                y0 = 90
+            question_rect = fitz.Rect(rect.x0, max(rect.y0, y0), rect.x1, rect.y1)
+            image = _render(page, question_rect, dpi)
+            text11 = _ocr_tesseract(image, 11)
+            text11 = _prepend_missing_first_question(text11, page, question_rect, expected_start, dpi)
+            candidates11 = _normalise_candidate_numbers(_parse_column_candidates(text11), expected_start, declared_count)
+
+            raw_numbers = [c.get("raw_number") for c in _parse_column_candidates(text11)]
+            raw_candidates = _parse_column_candidates(text11)
+            damaged_implicit_stem = any(
+                candidate.get("raw_number") is None
+                and re.match(r"^\s*[0-9০-৯]{2,4}[,.)]", candidate.get("prompt", ""))
+                for candidate in raw_candidates
+            )
+            sequence_problem = (
+                not candidates11
+                or any(len(q.get("options", [])) < 4 for q in candidates11)
+                or any(not q.get("prompt") for q in candidates11)
+                or damaged_implicit_stem
+                or any(isinstance(n, int) and (n < expected_start or n > expected_start + 12) for n in raw_numbers)
+                or any(isinstance(a, int) and isinstance(b, int) and b > a + 1 for a, b in zip(raw_numbers, raw_numbers[1:]))
+            )
+            candidate_sets = [candidates11]
+            if sequence_problem:
+                text3 = _ocr_tesseract(image, 3)
+                text3 = _prepend_missing_first_question(text3, page, question_rect, expected_start, dpi)
+                candidates3 = _normalise_candidate_numbers(_parse_column_candidates(text3), expected_start, declared_count)
+                candidate_sets.append(candidates3)
+
+            merged = _merge_candidate_sets(candidate_sets)
+            if any(len(q.get("options", [])) < 4 for q in merged):
+                # A third segmentation pass is reserved for incomplete blocks;
+                # it costs extra CPU only on columns where options are missing.
+                text6 = _ocr_tesseract(_render(page, question_rect, max(dpi, 280)), 6)
+                text6 = _prepend_missing_first_question(text6, page, question_rect, expected_start, dpi)
+                candidates6 = _normalise_candidate_numbers(_parse_column_candidates(text6), expected_start, declared_count)
+                candidate_sets.append(candidates6)
+                merged = _merge_candidate_sets(candidate_sets)
+            if merged:
+                page_texts.append("\n".join(
+                    [f"{q['number']}. {q['prompt']}\n" + "\n".join(f"({chr(0x0995 + i)}) {opt}" for i, opt in enumerate(q['options'])) for q in merged]
+                ))
+                expected_start = max(expected_start, max(q["number"] for q in merged) + 1)
+            else:
+                page_texts.append("")
+    return page_texts, "tesseract-ben+eng"
+
+
+def _make_page_composite(page: fitz.Page, page_index: int, dpi: int) -> Image.Image:
+    columns = _column_rectangles(page)
+    images: list[Image.Image] = []
+    if page_index == 0:
+        header_rect = fitz.Rect(18, 12, page.rect.width - 18, min(130, page.rect.height))
+        images.append(_render(page, header_rect, dpi))
+    for column_index, rect in enumerate(columns):
+        y0 = 90 if page_index == 0 else 25
+        if page_index == 0 and len(columns) == 2 and column_index == 1:
+            y0 = 90
+        images.append(_render(page, fitz.Rect(rect.x0, max(rect.y0, y0), rect.x1, rect.y1), dpi))
+    width = max(image.width for image in images)
+    gap = max(32, int(dpi * 0.12))
+    height = sum(image.height for image in images) + gap * (len(images) - 1)
+    composite = Image.new("RGB", (width, height), "white")
+    y = 0
+    for image in images:
+        composite.paste(image, (0, y))
+        y += image.height + gap
+    return composite
+
+
+def _ocr_space_image(client: httpx.Client, image: Image.Image, api_key: str, engine: int) -> str:
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", quality=88, optimize=True)
+    files = {"file": ("exam-page.jpg", buffer.getvalue(), "image/jpeg")}
+    data = {
+        "language": "auto",
+        "OCREngine": str(engine),
+        "isOverlayRequired": "false",
+        "scale": "true",
+        "filetype": "JPG",
+    }
+    response = client.post("https://api.ocr.space/parse/image", headers={"apikey": api_key}, data=data, files=files)
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("IsErroredOnProcessing"):
+        errors = payload.get("ErrorMessage") or payload.get("ErrorDetails") or "OCR provider could not process this page."
+        if isinstance(errors, list):
+            errors = "; ".join(str(x) for x in errors)
+        raise OCRServiceError(str(errors))
+    parsed = payload.get("ParsedResults") or []
+    text = "\n".join(item.get("ParsedText", "") for item in parsed)
+    if not text.strip():
+        raise OCRServiceError("OCR provider returned no readable text for a page.")
+    return text
+
+
+def _ocr_remote_columns(document: fitz.Document, dpi: int, api_key: str, engine: int, timeout: int) -> tuple[list[str], str]:
+    page_texts: list[str] = []
+    with httpx.Client(timeout=httpx.Timeout(timeout, connect=20)) as client:
+        for page_index, page in enumerate(document):
+            composite = _make_page_composite(page, page_index, dpi)
+            page_texts.append(_ocr_space_image(client, composite, api_key, engine))
+    return page_texts, f"ocr.space-engine-{engine}"
+
+
+def _parse_question_pages(page_texts: list[str], declared_count: int | None) -> list[dict[str, Any]]:
+    questions: list[dict[str, Any]] = []
+    expected_start = 1
+    for text in page_texts:
+        candidates = _normalise_candidate_numbers(_parse_column_candidates(text), expected_start, declared_count)
+        for candidate in candidates:
+            options = candidate.get("options", [])[:4]
+            prompt = _clean(candidate.get("prompt", ""))
+            if not prompt:
+                continue
+            kind = "mcq" if len(options) >= 2 else "short_answer"
+            if len(options) == 2 and re.search(r"সত্য|মিথ্যা|true|false", " ".join(options), re.IGNORECASE):
+                kind = "true_false"
+            warnings: list[str] = []
+            if len(options) == 0:
+                warnings.append("No options detected. Confirm this is a short-answer question or repair the OCR text.")
+            elif len(options) < 4 and kind == "mcq":
+                warnings.append(f"Only {len(options)} options were detected; check whether an option was missed by OCR.")
+            if len(prompt) < 12:
+                warnings.append("Question text is unusually short; check the original PDF.")
+            confidence = 0.82 if len(options) == 4 and len(prompt) >= 12 else (0.72 if len(options) == 3 else (0.62 if len(options) == 2 else 0.40))
+            questions.append({
+                "number": candidate["number"],
+                "kind": kind,
+                "prompt": prompt,
+                "options": [{"key": chr(ord("A") + i), "text": value} for i, value in enumerate(options)],
+                "answer_key": {},
+                "marks": 1,
+                "negative_marks": 0,
+                "confidence": confidence,
+                "needs_review": True,
+                "answer_key_missing": True,
+                "warnings": warnings,
+            })
+        if candidates:
+            expected_start = max(expected_start, max(q["number"] for q in candidates) + 1)
+
+    # Remove duplicate question numbers created by OCR overlaps. Keep the
+    # candidate with the most complete stem/options.
+    unique: dict[int, dict[str, Any]] = {}
+    for question in questions:
+        existing = unique.get(question["number"])
+        score = len(question["prompt"]) + 40 * len(question["options"])
+        old_score = len(existing["prompt"]) + 40 * len(existing["options"]) if existing else -1
+        if score > old_score:
+            unique[question["number"]] = question
+    return [unique[n] for n in sorted(unique)]
 
 
 def parse_exam_pdf(
@@ -297,82 +533,80 @@ def parse_exam_pdf(
     filename: str,
     max_pages: int = 30,
     dpi: int = 240,
-    ocr_space_api_key: str = '',
+    ocr_space_api_key: str = "",
     ocr_space_engine: int = 3,
     ocr_space_timeout_seconds: int = 90,
 ) -> dict[str, Any]:
     try:
-        document = fitz.open(stream=raw, filetype='pdf')
+        document = fitz.open(stream=raw, filetype="pdf")
     except Exception as exc:
-        raise ValueError('The uploaded file is not a readable PDF.') from exc
+        raise ValueError("The uploaded file is not a readable PDF.") from exc
     if document.is_encrypted:
         document.close()
-        raise ValueError('Password-protected PDFs are not supported. Upload an unlocked PDF.')
+        raise ValueError("Password-protected PDFs are not supported. Upload an unlocked PDF.")
     page_count = len(document)
-    if page_count == 0:
-        document.close()
-        raise ValueError('The uploaded PDF contains no pages.')
     if page_count > max_pages:
         document.close()
-        raise ValueError(f'This PDF has {page_count} pages; the current limit is {max_pages} pages.')
+        raise ValueError(f"This PDF has {page_count} pages; the current limit is {max_pages} pages.")
 
+    native_text = "\n".join(page.get_text("text") for page in document)
+    has_bengali = bool(BENGALI_RE.search(native_text))
+    # Bengali embedded fonts frequently expose a broken ToUnicode map even
+    # when the page looks perfect. OCR them rather than trusting garbled text.
+    use_ocr = has_bengali or len(native_text.strip()) < 100
     ocr_used = False
-    try:
-        native_pages = [page.get_text('text') for page in document]
-        native_text = '\n'.join(native_pages)
-        if _native_text_is_usable(native_text):
-            # Use the embedded text layer. This is faster, cheaper, and avoids sending
-            # a digital PDF to an OCR provider unnecessarily.
-            page_texts = native_pages
-        else:
-            ocr_used = True
-            if _local_tesseract_ready():
-                try:
-                    page_texts = _ocr_with_tesseract(document, dpi)
-                except Exception as local_exc:
-                    if ocr_space_api_key:
-                        page_texts = _ocr_with_ocr_space(raw, filename, ocr_space_api_key, ocr_space_engine, ocr_space_timeout_seconds)
-                    else:
-                        raise PDFOCRUnavailableError(
-                            'This PDF needs Bengali OCR, but Tesseract Bengali language data is unavailable on this host. '
-                            'Configure OCR_SPACE_API_KEY in FastAPI Cloud or deploy the backend with Tesseract and Bengali language data.'
-                        ) from local_exc
-            elif ocr_space_api_key:
-                page_texts = _ocr_with_ocr_space(raw, filename, ocr_space_api_key, ocr_space_engine, ocr_space_timeout_seconds)
-            else:
-                raise PDFOCRUnavailableError(
-                    'This PDF appears to be scanned or uses a legacy Bengali font. FastAPI Cloud does not provide the Tesseract '
-                    'system executable by default. Add OCR_SPACE_API_KEY as an encrypted FastAPI Cloud secret for managed Bengali OCR, '
-                    'or deploy the backend in a Docker environment with Tesseract and Bengali language data installed.'
-                )
-    finally:
-        document.close()
+    ocr_engine = "embedded-text"
+    metadata_text = native_text
 
-    combined_text = '\n'.join(page_texts)
-    metadata = _metadata(combined_text)
-    questions = _parse_question_pages(page_texts, metadata['declared_question_count'])
+    if use_ocr:
+        ocr_used = True
+        if _tesseract_ready():
+            # Read the page-one heading separately for reliable subject/chapter/set metadata.
+            header_rect = fitz.Rect(18, 12, document[0].rect.width - 18, min(130, document[0].rect.height))
+            header_text = _ocr_tesseract(_render(document[0], header_rect, max(dpi, 280)), 11)
+            metadata_text = header_text
+            page_texts, ocr_engine = _ocr_local_columns(document, dpi, None)
+        elif ocr_space_api_key:
+            page_texts, ocr_engine = _ocr_remote_columns(document, dpi, ocr_space_api_key, ocr_space_engine, ocr_space_timeout_seconds)
+            metadata_text = page_texts[0] if page_texts else native_text
+        else:
+            document.close()
+            raise OCRUnavailableError(
+                "Bengali OCR is not configured on this cloud deployment. Add OCR_SPACE_API_KEY in FastAPI Cloud environment variables, then redeploy."
+            )
+    else:
+        # For clean native-text PDFs, retain page text. PyMuPDF preserves
+        # column reading order for standard single-column documents.
+        page_texts = [page.get_text("text") for page in document]
+
+    document.close()
+    metadata = _metadata(metadata_text)
+    questions = _parse_question_pages(page_texts, metadata["declared_question_count"])
     warnings: list[str] = []
-    if not metadata['subject']:
-        warnings.append('Could not confidently identify the subject from the PDF heading.')
-    if not metadata['chapter']:
-        warnings.append('Chapter was not detected. Enter it manually if applicable.')
-    if not metadata['set_name']:
-        warnings.append('Set name was not detected. Enter it manually if applicable.')
-    if metadata['declared_question_count'] and metadata['declared_question_count'] != len(questions):
+    if ocr_used:
+        warnings.append("OCR was used. Review Bengali wording, chemical formulas, subscripts, and symbols against the original PDF before publishing.")
+    if not metadata["subject"]:
+        warnings.append("Could not confidently identify the subject from the PDF heading.")
+    if not metadata["chapter"]:
+        warnings.append("Chapter was not detected. Enter it manually if applicable.")
+    if not metadata["set_name"]:
+        warnings.append("Set name was not detected. Enter it manually if applicable.")
+    if metadata["declared_question_count"] and metadata["declared_question_count"] != len(questions):
         warnings.append(f"The PDF declares {metadata['declared_question_count']} questions, but {len(questions)} question blocks were detected. Review missing or merged questions.")
     if not questions:
-        warnings.append('No structured questions were detected. This PDF may need a different OCR layout or manual entry.')
-    for q in questions:
-        if q['confidence'] < 0.7:
-            warnings.append(f"Question {q['number']} needs manual review.")
+        warnings.append("No structured questions were detected. This PDF may need a different OCR layout or manual entry.")
+    for question in questions:
+        if question["confidence"] < 0.7:
+            warnings.append(f"Question {question['number']} needs manual review.")
 
     return {
-        'filename': filename,
-        'pages': page_count,
-        'ocr_used': ocr_used,
-        'metadata': metadata,
-        'questions': questions,
-        'question_count_detected': len(questions),
-        'warnings': list(dict.fromkeys(warnings)),
-        'extraction_note': 'Extracted content is a draft. Review all question text and options before creating an exam. Correct answers are not inferred when the PDF does not provide an answer key.',
+        "filename": filename,
+        "pages": page_count,
+        "ocr_used": ocr_used,
+        "ocr_engine": ocr_engine,
+        "metadata": metadata,
+        "questions": questions,
+        "question_count_detected": len(questions),
+        "warnings": list(dict.fromkeys(warnings)),
+        "extraction_note": "Extracted content is a draft. Review all question text and options before creating an exam. Correct answers are not inferred when the PDF does not provide an answer key.",
     }
