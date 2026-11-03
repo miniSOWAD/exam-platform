@@ -19,7 +19,16 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("CORS_ORIGINS", "FRONTEND_ORIGINS"),
     )
     cookie_secure: bool = Field(default=False, validation_alias=AliasChoices("COOKIE_SECURE"))
+    # Profile-photo limit (300 KiB); deliberately separate from question-paper PDFs.
     max_upload_bytes: int = Field(default=307200, ge=1, validation_alias=AliasChoices("MAX_UPLOAD_BYTES"))
+    # PDF question-paper upload limit. The import UI advertises 15 MB.
+    max_pdf_upload_mb: int = Field(default=15, ge=1, le=30, validation_alias=AliasChoices("MAX_PDF_UPLOAD_MB"))
+    max_pdf_pages: int = Field(default=30, ge=1, le=100, validation_alias=AliasChoices("MAX_PDF_PAGES"))
+    pdf_ocr_dpi: int = Field(default=240, ge=100, le=400, validation_alias=AliasChoices("PDF_OCR_DPI"))
+    # Optional managed OCR fallback for FastAPI Cloud, where OS-level Tesseract is not installed.
+    ocr_space_api_key: str = Field(default="", validation_alias=AliasChoices("OCR_SPACE_API_KEY"))
+    ocr_space_engine: int = Field(default=3, ge=1, le=3, validation_alias=AliasChoices("OCR_SPACE_ENGINE"))
+    ocr_space_timeout_seconds: int = Field(default=90, ge=10, le=300, validation_alias=AliasChoices("OCR_SPACE_TIMEOUT_SECONDS"))
     allowed_image_types: str = Field(
         default="image/jpeg,image/png,image/webp,image/jpg",
         validation_alias=AliasChoices("ALLOWED_IMAGE_TYPES"),

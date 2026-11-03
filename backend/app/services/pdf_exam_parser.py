@@ -7,10 +7,12 @@ Extracted answers are never guessed; the answer key stays empty unless supplied.
 from __future__ import annotations
 
 import re
+import shutil
 import unicodedata
 from typing import Any
 
 import fitz
+import httpx
 import pytesseract
 from PIL import Image
 from io import BytesIO
@@ -212,61 +214,165 @@ def _parse_question_pages(page_texts: list[str], declared_count: int | None) -> 
     return questions
 
 
-def parse_exam_pdf(raw: bytes, filename: str, max_pages: int = 30, dpi: int = 240) -> dict[str, Any]:
+class PDFOCRUnavailableError(RuntimeError):
+    """Raised when a scanned/legacy-font PDF needs OCR but no OCR engine is configured."""
+
+
+class PDFOCRServiceError(RuntimeError):
+    """Raised when the configured remote OCR provider cannot process a PDF."""
+
+
+def _native_text_is_usable(native_text: str) -> bool:
+    """Avoid OCR when PyMuPDF already extracted readable, numbered question text.
+
+    Bengali text PDFs frequently have a perfectly usable Unicode text layer. The old
+    implementation OCRed every Bengali PDF, unnecessarily requiring the Tesseract
+    executable on FastAPI Cloud. We only OCR when the text layer is blank/too short or
+    Bengali text exists but no question block can be recognized from it.
+    """
+    if len((native_text or '').strip()) < 40:
+        return False
+    has_bengali = bool(BENGALI_RE.search(native_text))
+    marker_count = sum(1 for line in native_text.splitlines() if _question_marker(_clean(line)))
+    if has_bengali and marker_count == 0:
+        return False
+    return marker_count > 0
+
+
+def _local_tesseract_ready() -> bool:
+    """Return true only if the Tesseract binary and Bengali + English data are present."""
+    if not shutil.which('tesseract'):
+        return False
     try:
-        document = fitz.open(stream=raw, filetype="pdf")
+        languages = set(pytesseract.get_languages(config=''))
+        return {'ben', 'eng'}.issubset(languages)
+    except Exception:
+        return False
+
+
+def _ocr_with_tesseract(document: fitz.Document, dpi: int) -> list[str]:
+    texts: list[str] = []
+    for page in document:
+        pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), alpha=False)
+        with Image.open(BytesIO(pix.tobytes('png'))) as image:
+            texts.append(pytesseract.image_to_string(image, lang='ben+eng', config='--oem 1 --psm 3'))
+    return texts
+
+
+def _ocr_with_ocr_space(raw: bytes, filename: str, api_key: str, engine: int, timeout: int) -> list[str]:
+    """Optional cloud OCR fallback. The PDF is sent to OCR.Space only when configured."""
+    try:
+        response = httpx.post(
+            'https://api.ocr.space/parse/image',
+            headers={'apikey': api_key},
+            data={
+                'filetype': 'PDF',
+                'OCREngine': str(engine),
+                'isOverlayRequired': 'false',
+                'scale': 'true',
+            },
+            files={'file': (filename or 'question-paper.pdf', raw, 'application/pdf')},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise PDFOCRServiceError('The configured OCR service could not be reached. Please retry or check the OCR service configuration.') from exc
+
+    if payload.get('IsErroredOnProcessing'):
+        error = payload.get('ErrorMessage') or payload.get('ErrorDetails') or 'OCR provider rejected the document.'
+        if isinstance(error, list):
+            error = '; '.join(str(item) for item in error)
+        raise PDFOCRServiceError(f'OCR service error: {str(error)[:300]}')
+
+    parsed = payload.get('ParsedResults') or []
+    page_texts = [str(item.get('ParsedText') or '') for item in parsed]
+    if not page_texts or not any(text.strip() for text in page_texts):
+        raise PDFOCRServiceError('The OCR service returned no readable text for this PDF.')
+    return page_texts
+
+
+def parse_exam_pdf(
+    raw: bytes,
+    filename: str,
+    max_pages: int = 30,
+    dpi: int = 240,
+    ocr_space_api_key: str = '',
+    ocr_space_engine: int = 3,
+    ocr_space_timeout_seconds: int = 90,
+) -> dict[str, Any]:
+    try:
+        document = fitz.open(stream=raw, filetype='pdf')
     except Exception as exc:
-        raise ValueError("The uploaded file is not a readable PDF.") from exc
+        raise ValueError('The uploaded file is not a readable PDF.') from exc
     if document.is_encrypted:
         document.close()
-        raise ValueError("Password-protected PDFs are not supported. Upload an unlocked PDF.")
+        raise ValueError('Password-protected PDFs are not supported. Upload an unlocked PDF.')
     page_count = len(document)
+    if page_count == 0:
+        document.close()
+        raise ValueError('The uploaded PDF contains no pages.')
     if page_count > max_pages:
         document.close()
-        raise ValueError(f"This PDF has {page_count} pages; the current limit is {max_pages} pages.")
+        raise ValueError(f'This PDF has {page_count} pages; the current limit is {max_pages} pages.')
 
-    native_text = "\n".join(page.get_text("text") for page in document)
-    has_bengali = bool(BENGALI_RE.search(native_text))
-    page_texts: list[str] = []
     ocr_used = False
-    # A blank text layer is typical of scanned/image-only PDFs; OCR those too.
-    use_ocr = has_bengali or len(native_text.strip()) < 100
-    if use_ocr:
-        ocr_used = True
-        for page in document:
-            pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), alpha=False)
-            with Image.open(BytesIO(pix.tobytes("png"))) as image:
-                text = pytesseract.image_to_string(image, lang="ben+eng", config="--oem 1 --psm 3")
-            page_texts.append(text)
-    else:
-        page_texts = [page.get_text("text") for page in document]
-    document.close()
+    try:
+        native_pages = [page.get_text('text') for page in document]
+        native_text = '\n'.join(native_pages)
+        if _native_text_is_usable(native_text):
+            # Use the embedded text layer. This is faster, cheaper, and avoids sending
+            # a digital PDF to an OCR provider unnecessarily.
+            page_texts = native_pages
+        else:
+            ocr_used = True
+            if _local_tesseract_ready():
+                try:
+                    page_texts = _ocr_with_tesseract(document, dpi)
+                except Exception as local_exc:
+                    if ocr_space_api_key:
+                        page_texts = _ocr_with_ocr_space(raw, filename, ocr_space_api_key, ocr_space_engine, ocr_space_timeout_seconds)
+                    else:
+                        raise PDFOCRUnavailableError(
+                            'This PDF needs Bengali OCR, but Tesseract Bengali language data is unavailable on this host. '
+                            'Configure OCR_SPACE_API_KEY in FastAPI Cloud or deploy the backend with Tesseract and Bengali language data.'
+                        ) from local_exc
+            elif ocr_space_api_key:
+                page_texts = _ocr_with_ocr_space(raw, filename, ocr_space_api_key, ocr_space_engine, ocr_space_timeout_seconds)
+            else:
+                raise PDFOCRUnavailableError(
+                    'This PDF appears to be scanned or uses a legacy Bengali font. FastAPI Cloud does not provide the Tesseract '
+                    'system executable by default. Add OCR_SPACE_API_KEY as an encrypted FastAPI Cloud secret for managed Bengali OCR, '
+                    'or deploy the backend in a Docker environment with Tesseract and Bengali language data installed.'
+                )
+    finally:
+        document.close()
 
-    combined_text = "\n".join(page_texts)
+    combined_text = '\n'.join(page_texts)
     metadata = _metadata(combined_text)
-    questions = _parse_question_pages(page_texts, metadata["declared_question_count"])
+    questions = _parse_question_pages(page_texts, metadata['declared_question_count'])
     warnings: list[str] = []
-    if not metadata["subject"]:
-        warnings.append("Could not confidently identify the subject from the PDF heading.")
-    if not metadata["chapter"]:
-        warnings.append("Chapter was not detected. Enter it manually if applicable.")
-    if not metadata["set_name"]:
-        warnings.append("Set name was not detected. Enter it manually if applicable.")
-    if metadata["declared_question_count"] and metadata["declared_question_count"] != len(questions):
+    if not metadata['subject']:
+        warnings.append('Could not confidently identify the subject from the PDF heading.')
+    if not metadata['chapter']:
+        warnings.append('Chapter was not detected. Enter it manually if applicable.')
+    if not metadata['set_name']:
+        warnings.append('Set name was not detected. Enter it manually if applicable.')
+    if metadata['declared_question_count'] and metadata['declared_question_count'] != len(questions):
         warnings.append(f"The PDF declares {metadata['declared_question_count']} questions, but {len(questions)} question blocks were detected. Review missing or merged questions.")
     if not questions:
-        warnings.append("No structured questions were detected. This PDF may need a different OCR layout or manual entry.")
+        warnings.append('No structured questions were detected. This PDF may need a different OCR layout or manual entry.')
     for q in questions:
-        if q["confidence"] < 0.7:
+        if q['confidence'] < 0.7:
             warnings.append(f"Question {q['number']} needs manual review.")
 
     return {
-        "filename": filename,
-        "pages": page_count,
-        "ocr_used": ocr_used,
-        "metadata": metadata,
-        "questions": questions,
-        "question_count_detected": len(questions),
-        "warnings": list(dict.fromkeys(warnings)),
-        "extraction_note": "Extracted content is a draft. Review all question text and options before creating an exam. Correct answers are not inferred when the PDF does not provide an answer key.",
+        'filename': filename,
+        'pages': page_count,
+        'ocr_used': ocr_used,
+        'metadata': metadata,
+        'questions': questions,
+        'question_count_detected': len(questions),
+        'warnings': list(dict.fromkeys(warnings)),
+        'extraction_note': 'Extracted content is a draft. Review all question text and options before creating an exam. Correct answers are not inferred when the PDF does not provide an answer key.',
     }

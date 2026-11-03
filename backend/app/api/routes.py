@@ -8,9 +8,10 @@ from app.core.security import hash_password, verify_password, create_token, deco
 from app.core.config import settings
 from app.models.entities import User, Role, Exam, ExamStatus, Question, Attempt, AccessGrant, PermissionGrant, HistoricalResult, SiteContent
 from app.schemas.api import RegisterIn, LoginIn, UserOut, ExamIn, QuestionIn, AnswerIn, GrantIn, PermissionIn, PDFCreateExamIn, SiteContentUpdate, ScheduleUpdate, ExtendTimeIn
-from app.services.pdf_exam_parser import parse_exam_pdf
+from app.services.pdf_exam_parser import parse_exam_pdf, PDFOCRUnavailableError, PDFOCRServiceError
 from app.services.cloudinary_images import InvalidProfileImage, validate_image_bytes, upload_image, delete_image
 from fastapi import Request
+from fastapi.concurrency import run_in_threadpool
 
 router=APIRouter()
 DEFAULT_SITE_CONTENT={
@@ -457,16 +458,32 @@ async def preview_exam_pdf(file:UploadFile=File(...),db:Session=Depends(get_db),
     require(user,db,"question.manage")
     if file.content_type!="application/pdf" and not (file.filename or "").lower().endswith(".pdf"):
         raise HTTPException(415,"PDF files only")
-    raw=await file.read(settings.max_upload_mb*1024*1024+1)
-    if len(raw)>settings.max_upload_mb*1024*1024: raise HTTPException(413,"File too large")
+    # PDF papers may be much larger than profile photos. Do not reuse MAX_UPLOAD_BYTES
+    # (the 300 KiB avatar limit) and do not reference the old, undefined max_upload_mb.
+    pdf_limit=settings.max_pdf_upload_mb*1024*1024
+    raw=await file.read(pdf_limit+1)
+    if len(raw)>pdf_limit: raise HTTPException(413,f"PDF is too large. Maximum allowed size is {settings.max_pdf_upload_mb} MB.")
     try:
-        return parse_exam_pdf(raw,file.filename or "uploaded.pdf",max_pages=30,dpi=240)
+        return await run_in_threadpool(
+            parse_exam_pdf,
+            raw,
+            file.filename or "uploaded.pdf",
+            settings.max_pdf_pages,
+            settings.pdf_ocr_dpi,
+            settings.ocr_space_api_key,
+            settings.ocr_space_engine,
+            settings.ocr_space_timeout_seconds,
+        )
+    except PDFOCRUnavailableError as exc:
+        raise HTTPException(503,str(exc))
+    except PDFOCRServiceError as exc:
+        raise HTTPException(502,str(exc))
     except ValueError as exc:
         raise HTTPException(400,str(exc))
-    except Exception as exc:
-        # Keep parser/OCR internals out of the response, but explain the missing dependency.
-        if "tesseract" in str(exc).lower() or "executable" in str(exc).lower():
-            raise HTTPException(503,"Bengali OCR is unavailable. Deploy the backend image with Tesseract and Bengali language data installed.")
+    except Exception:
+        # Log the traceback in FastAPI Cloud logs while returning a safe message to the client.
+        import logging
+        logging.getLogger("examflow.pdf").exception("PDF question extraction failed")
         raise HTTPException(422,"Could not extract structured questions from this PDF. Try a clearer PDF or use manual question entry.")
 
 
@@ -510,8 +527,9 @@ async def import_pdf(file:UploadFile=File(...),kind:str="questions",db:Session=D
     require(user,db,"student.import" if kind!="questions" else "question.manage")
     if file.content_type!="application/pdf" and not (file.filename or "").lower().endswith(".pdf"):
         raise HTTPException(415,"PDF files only")
-    raw=await file.read(settings.max_upload_mb*1024*1024+1)
-    if len(raw)>settings.max_upload_mb*1024*1024: raise HTTPException(413,"File too large")
+    pdf_limit=settings.max_pdf_upload_mb*1024*1024
+    raw=await file.read(pdf_limit+1)
+    if len(raw)>pdf_limit: raise HTTPException(413,f"PDF is too large. Maximum allowed size is {settings.max_pdf_upload_mb} MB.")
     try:
         doc=fitz.open(stream=raw,filetype="pdf"); pages=[p.get_text("text") for p in doc]
     except Exception: raise HTTPException(400,"Could not read PDF")
