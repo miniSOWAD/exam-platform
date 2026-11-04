@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { ArrowUpRight, FlaskConical, LayoutDashboard, LogOut, UserRound } from 'lucide-react';
-import { api } from '@/lib/api';
+import { api, isUnauthorizedError } from '@/lib/api';
 import { useSiteContent } from '@/components/SiteContentProvider';
 
 type User = { id: string; email: string; full_name: string; role: string; avatar_url?: string | null };
@@ -20,7 +20,7 @@ export default function Header() {
 
   useEffect(() => {
     let active = true;
-    const loadUser = () => api<User>('/auth/me').then((data) => { if (active) setUser(data); }).catch(() => { if (active) setUser(null); });
+    const loadUser = () => api<User>('/auth/me').then((data) => { if (active) setUser(data); }).catch((error: unknown) => { if (active && isUnauthorizedError(error)) setUser(null); });
     void loadUser();
     const handleAuthChange = () => { void loadUser(); };
     window.addEventListener('examflow:auth-changed', handleAuthChange);
@@ -64,7 +64,7 @@ export default function Header() {
                 </button>
                 {menuOpen && <div className="header-profile-popover">
                   <div className="header-popover-user"><strong>{user.full_name}</strong><span>{user.role}</span></div>
-                  <Link href="/dashboard" onClick={() => setMenuOpen(false)}><LayoutDashboard size={15}/> My dashboard</Link>
+                  <Link href="/dashboard" onClick={() => setMenuOpen(false)}><LayoutDashboard size={15}/> {user.role === 'admin' ? 'Admin workspace' : 'My dashboard'}</Link>
                   <Link href="/dashboard/profile" onClick={() => setMenuOpen(false)}><UserRound size={15}/> My profile</Link>
                   {user.role === 'admin' && <Link href="/dashboard/site-content" onClick={() => setMenuOpen(false)}>Edit website content</Link>}
                   <button type="button" onClick={signOut}><LogOut size={15}/> Sign out</button>

@@ -52,6 +52,7 @@ export default function ImportExamPage() {
   const [subject, setSubject] = useState('');
   const [chapter, setChapter] = useState('');
   const [setName, setSetName] = useState('');
+  const [paper, setPaper] = useState('');
   const [duration, setDuration] = useState('60');
   const [accessMode, setAccessMode] = useState<'all_students' | 'selected_students'>('all_students');
   const [maxAttempts, setMaxAttempts] = useState('1');
@@ -71,6 +72,7 @@ export default function ImportExamPage() {
       setSubject(result.metadata.subject || 'General');
       setChapter(result.metadata.chapter || '');
       setSetName(result.metadata.set_name || '');
+      setPaper('');
       setDuration(String(result.metadata.duration_minutes || 60));
       const generatedTitle = [result.metadata.exam_title, result.metadata.subject, result.metadata.chapter, result.metadata.set_name].filter(Boolean).join(' — ');
       setTitle(generatedTitle || file.name.replace(/\.pdf$/i, ''));
@@ -109,7 +111,7 @@ export default function ImportExamPage() {
       await api<{ id: string }>('/imports/pdf/create-exam', {
         method: 'POST',
         body: JSON.stringify({
-          title, subject, chapter: chapter || null, set_name: setName || null,
+          title, subject, chapter: chapter || null, set_name: setName || null, paper: paper || null,
           duration_minutes: Number(duration), declared_question_count: preview.metadata.declared_question_count,
           access_mode: accessMode, max_attempts: Number(maxAttempts), publish_immediately: publishImmediately, source_file_name: preview.filename,
           questions: selected.map(({ number, kind, prompt, options, answer_key, marks, negative_marks }) => ({ number, kind, prompt, options, answer_key, marks, negative_marks })),
@@ -141,6 +143,7 @@ export default function ImportExamPage() {
           <label className="text-sm font-bold">Subject / paper<input className="field mt-2 font-normal" value={subject} onChange={(e) => setSubject(e.target.value)}/></label>
           <label className="text-sm font-bold">Chapter<input className="field mt-2 font-normal" value={chapter} onChange={(e) => setChapter(e.target.value)}/></label>
           <label className="text-sm font-bold">Set<input className="field mt-2 font-normal" value={setName} onChange={(e) => setSetName(e.target.value)}/></label>
+          <label className="text-sm font-bold">Paper (optional)<select className="field mt-2 font-normal" value={paper} onChange={(e) => setPaper(e.target.value)}><option value="">Not specified</option><option value="1st Paper">1st Paper</option><option value="2nd Paper">2nd Paper</option></select></label>
           <label className="text-sm font-bold">Duration (minutes)<input className="field mt-2 font-normal" type="number" min="1" max="1440" value={duration} onChange={(e) => setDuration(e.target.value)}/></label>
           <label className="text-sm font-bold">Maximum attempts<input className="field mt-2 font-normal" type="number" min="1" max="20" value={maxAttempts} onChange={(e) => setMaxAttempts(e.target.value)}/></label>
           <label className="text-sm font-bold">Participation access<select className="field mt-2 font-normal" value={accessMode} onChange={(e) => setAccessMode(e.target.value as typeof accessMode)}><option value="all_students">All registered students</option><option value="selected_students">Selected students only</option></select></label>

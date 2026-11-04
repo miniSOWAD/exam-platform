@@ -3,9 +3,9 @@
 import { FormEvent, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { api } from '@/lib/api';
+import { api, isUnauthorizedError } from '@/lib/api';
 import {
-  LogOut, BookOpen, Users, Clock3, Plus, FileUp, Globe2, CalendarClock,
+  LogOut, BookOpen, Users, Clock3, Plus, FileUp, CalendarClock,
   Play, Pause, RotateCcw, Square, FileCheck2, FileText, X, Loader2,
   AlertTriangle, CheckCircle2, Upload,
 } from 'lucide-react';
@@ -13,7 +13,7 @@ import {
 type User = { id: string; email: string; full_name: string; role: string };
 type Exam = {
   id: string; title: string; subject: string; chapter?: string | null; set_name?: string | null;
-  status: string; duration_seconds: number; question_count: number;
+  status: string; duration_seconds: number; question_count: number; paper?: string | null;
   scheduled_start_at?: string | null; scheduled_end_at?: string | null; time_extension_seconds?: number;
 };
 type AnswerPreviewRow = {
@@ -55,12 +55,17 @@ function statusLabel(status: string) {
 
 export default function Dashboard() {
   const [user, setUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const [exams, setExams] = useState<Exam[]>([]);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [title, setTitle] = useState('');
   const [subject, setSubject] = useState('General');
   const [duration, setDuration] = useState('60');
+  const [paper, setPaper] = useState('');
+  const [durationExam, setDurationExam] = useState<Exam | null>(null);
+  const [durationMinutes, setDurationMinutes] = useState('60');
+  const [durationSaving, setDurationSaving] = useState(false);
   const [creating, setCreating] = useState(false);
   const [answerExam, setAnswerExam] = useState<Exam | null>(null);
   const [answerFile, setAnswerFile] = useState<File | null>(null);
@@ -73,9 +78,28 @@ export default function Dashboard() {
   async function refreshExams() { setExams(await api<Exam[]>('/exams')); }
   useEffect(() => {
     let active = true;
-    Promise.all([api<User>('/auth/me'), api<Exam[]>('/exams')])
-      .then(([u, e]) => { if (active) { setUser(u); setExams(e); } })
-      .catch(() => router.replace('/login'));
+    async function loadWorkspace() {
+      try {
+        const currentUser = await api<User>('/auth/me');
+        if (!active) return;
+        setUser(currentUser);
+        try {
+          const examRows = await api<Exam[]>('/exams');
+          if (active) setExams(examRows);
+        } catch (error) {
+          if (!active) return;
+          if (isUnauthorizedError(error)) router.replace('/login?next=%2Fdashboard');
+          else setError(error instanceof Error ? error.message : 'Your session is active, but examinations could not be loaded.');
+        }
+      } catch (error) {
+        if (!active) return;
+        if (isUnauthorizedError(error)) router.replace('/login?next=%2Fdashboard');
+        else setError(error instanceof Error ? error.message : 'Could not connect to the ExamFlow API.');
+      } finally {
+        if (active) setAuthLoading(false);
+      }
+    }
+    void loadWorkspace();
     return () => { active = false; };
   }, [router]);
 
@@ -90,14 +114,45 @@ export default function Dashboard() {
     try { await api(`/exams/${id}/publish`, { method: 'POST' }); await refreshExams(); }
     catch (err) { setError(err instanceof Error ? err.message : 'Could not publish exam'); }
   }
+  function openDurationEditor(exam: Exam) {
+    setDurationExam(exam);
+    setDurationMinutes(String(Math.max(1, Math.round(exam.duration_seconds / 60))));
+    setError(''); setNotice('');
+  }
+
+  async function saveExamDuration(event: FormEvent) {
+    event.preventDefault();
+    if (!durationExam) return;
+    const nextMinutes = Number(durationMinutes);
+    const currentMinutes = Math.round(durationExam.duration_seconds / 60);
+    if (!Number.isInteger(nextMinutes) || nextMinutes < 1 || nextMinutes > 1440) {
+      setError('Duration must be between 1 and 1440 whole minutes.'); return;
+    }
+    if (nextMinutes < currentMinutes && ['live', 'paused'].includes(durationExam.status)) {
+      const proceed = window.confirm(`You are reducing this ${durationExam.status} exam from ${currentMinutes} to ${nextMinutes} minutes. Students whose elapsed time has passed the new limit may run out of time immediately. Continue?`);
+      if (!proceed) return;
+    }
+    setDurationSaving(true); setError(''); setNotice('');
+    try {
+      const result = await api<Exam & { attempts_now_out_of_time?: number }>(`/exams/${durationExam.id}/duration`, {
+        method: 'PATCH', body: JSON.stringify({ duration_minutes: nextMinutes }),
+      });
+      await refreshExams();
+      const warning = result.attempts_now_out_of_time ? ` ${result.attempts_now_out_of_time} active attempt(s) are now out of time.` : '';
+      setNotice(`Updated “${durationExam.title}” to ${nextMinutes} minutes.${warning}`);
+      setDurationExam(null);
+    } catch (err) { setError(err instanceof Error ? err.message : 'Could not update examination duration.'); }
+    finally { setDurationSaving(false); }
+  }
+
   async function createExam(event: FormEvent) {
     event.preventDefault(); setCreating(true); setError(''); setNotice('');
     try {
       await api('/exams', { method: 'POST', body: JSON.stringify({
         title, subject, duration_seconds: Number(duration) * 60, description: '',
-        access_mode: 'all_students', max_attempts: 1, pass_marks: 0,
+        access_mode: 'all_students', max_attempts: 1, pass_marks: 0, paper: paper || null,
       }) });
-      setTitle(''); await refreshExams();
+      setTitle(''); setPaper(''); await refreshExams();
     } catch (err) { setError(err instanceof Error ? err.message : 'Could not create exam'); }
     finally { setCreating(false); }
   }
@@ -146,16 +201,14 @@ export default function Dashboard() {
     } finally { setAnswerApplying(false); }
   }
 
-  if (!user) return <main className="container-shell py-20">Loading workspace…</main>;
+  if (authLoading) return <main className="container-shell py-20">Checking your workspace…</main>;
+  if (!user) return <main className="container-shell max-w-2xl py-20"><section className="card p-6"><h1 className="text-xl font-black">Workspace unavailable</h1><p role="alert" className="mt-3 text-sm text-red-700">{error || 'Your account could not be loaded.'}</p><button type="button" className="btn mt-5" onClick={() => window.location.reload()}>Retry</button></section></main>;
 
   return <>
     <main className="container-shell py-10">
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div><p className="text-sm font-bold text-brand">{user.role.toUpperCase()} WORKSPACE</p><h1 className="mt-1 text-3xl font-black">Welcome, {user.full_name}</h1><p className="mt-2 text-slate-500">Manage examinations, schedules and student progress.</p></div>
-        <div className="flex flex-wrap gap-2">
-          {user.role === 'admin' && <Link href="/dashboard/site-content" className="rounded-xl border border-teal-100 bg-teal-50 px-4 py-2 text-sm font-bold text-teal-800"><Globe2 className="mr-2 inline" size={16}/>Manage website</Link>}
-          <button onClick={logout} className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-bold"><LogOut className="mr-2 inline" size={16}/>Sign out</button>
-        </div>
+        {user.role !== 'admin' && <div className="flex flex-wrap gap-2"><button onClick={logout} className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-bold"><LogOut className="mr-2 inline" size={16}/>Sign out</button></div>}
       </div>
 
       <div className="mt-8 grid gap-4 md:grid-cols-3">
@@ -171,9 +224,10 @@ export default function Dashboard() {
       {error && <p role="alert" className="mt-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</p>}
       {notice && <p role="status" className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800">{notice}</p>}
 
-      {user.role !== 'student' && <form onSubmit={createExam} id="create" className="card mt-5 grid gap-3 p-5 md:grid-cols-[2fr_1fr_1fr_auto]">
+      {user.role !== 'student' && <form onSubmit={createExam} id="create" className="card mt-5 grid gap-3 p-5 md:grid-cols-[2fr_1fr_1fr_1fr_auto]">
         <input className="field" placeholder="Exam title" required value={title} onChange={(e) => setTitle(e.target.value)}/>
         <input className="field" placeholder="Subject" value={subject} onChange={(e) => setSubject(e.target.value)}/>
+        <select className="field" value={paper} onChange={(e) => setPaper(e.target.value)}><option value="">Paper (optional)</option><option value="1st Paper">1st Paper</option><option value="2nd Paper">2nd Paper</option></select>
         <input className="field" type="number" min="1" max="1440" value={duration} onChange={(e) => setDuration(e.target.value)}/>
         <button className="btn" disabled={creating}>{creating ? 'Creating…' : 'Create'}</button>
       </form>}
@@ -188,6 +242,7 @@ export default function Dashboard() {
             <Link href={`/exams/${exam.id}`} className="text-sm font-bold text-brand">Open exam →</Link>
             {user.role !== 'student' && <>
               <Link href={`/dashboard/exams/${exam.id}/edit`} className="text-sm font-bold text-slate-700">Edit questions</Link>
+              {user.role === 'admin' && ['draft', 'published', 'live', 'paused'].includes(exam.status) && <button type="button" onClick={() => openDurationEditor(exam)} className="inline-flex items-center gap-1 text-sm font-bold text-violet-700 hover:text-violet-900"><Clock3 size={15}/>Change duration</button>}
               <button type="button" onClick={() => openAnswerImporter(exam)} disabled={['live', 'paused', 'ended', 'results_published', 'archived'].includes(exam.status)} title={['live', 'paused', 'ended', 'results_published', 'archived'].includes(exam.status) ? 'Answer keys are locked after an exam starts.' : 'Upload a numbered PDF or TXT answer key'} className="inline-flex items-center gap-1 text-sm font-bold text-indigo-700 hover:text-indigo-900 disabled:cursor-not-allowed disabled:opacity-40"><FileCheck2 size={15}/>Add Answers / Modify Answers</button>
               <Link href={`/dashboard/exams/${exam.id}/schedule`} className="text-sm font-bold text-teal-700">Schedule & timing</Link>
               {exam.status === 'draft' && <button onClick={() => publishExam(exam.id)} className="text-sm font-bold text-emerald-700">Publish exam</button>}
@@ -201,6 +256,17 @@ export default function Dashboard() {
       </div>
       {exams.length === 0 && <div className="card mt-4 p-10 text-center text-slate-500">No examinations are available yet.</div>}
     </main>
+
+    {durationExam && <div className="fixed inset-0 z-[110] flex items-center justify-center overflow-y-auto bg-slate-950/50 p-4" onMouseDown={(event) => { if (event.target === event.currentTarget && !durationSaving) setDurationExam(null); }}>
+      <section role="dialog" aria-modal="true" aria-labelledby="duration-editor-title" className="my-auto w-full max-w-lg rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl sm:p-7">
+        <div className="flex items-start justify-between gap-4"><div><p className="text-xs font-bold uppercase tracking-wider text-violet-700">Administrator exam control</p><h2 id="duration-editor-title" className="mt-1 text-xl font-black">Change examination duration</h2><p className="mt-1 text-sm text-slate-500">{durationExam.title}</p></div><button type="button" onClick={() => setDurationExam(null)} disabled={durationSaving} className="rounded-lg px-3 py-1 text-slate-500 hover:bg-slate-100">✕</button></div>
+        <div className="mt-5 grid grid-cols-2 gap-3"><div className="rounded-xl bg-slate-50 p-3"><p className="text-xs text-slate-500">Current duration</p><strong className="mt-1 block text-2xl">{Math.round(durationExam.duration_seconds / 60)} min</strong></div><div className="rounded-xl bg-slate-50 p-3"><p className="text-xs text-slate-500">Exam status</p><strong className="mt-1 block text-lg capitalize">{durationExam.status.replace('_', ' ')}</strong></div></div>
+        <form onSubmit={saveExamDuration} className="mt-5 space-y-4"><label className="block text-sm font-bold">New total duration (minutes)<input className="field mt-2" type="number" min="1" max="1440" step="1" required value={durationMinutes} onChange={(event) => setDurationMinutes(event.target.value)}/></label>
+          {['live', 'paused'].includes(durationExam.status) && <p className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-900">This examination is already running or paused. Increasing the duration gives students more time. Reducing it may immediately expire attempts whose elapsed time exceeds the new limit.</p>}
+          <div className="flex justify-end gap-2 border-t border-slate-100 pt-4"><button type="button" className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-bold" onClick={() => setDurationExam(null)} disabled={durationSaving}>Cancel</button><button className="btn" disabled={durationSaving || Number(durationMinutes) < 1 || Number(durationMinutes) > 1440}>{durationSaving ? 'Updating…' : 'Save duration'}</button></div>
+        </form>
+      </section>
+    </div>}
 
     {answerExam && <div className="fixed inset-0 z-[100] flex items-center justify-center overflow-y-auto bg-slate-950/50 p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) closeAnswerImporter(); }}>
       <section role="dialog" aria-modal="true" aria-labelledby="answer-import-title" className="my-auto max-h-[92vh] w-full max-w-3xl overflow-y-auto rounded-2xl border border-slate-200 bg-white p-5 shadow-2xl sm:p-7">

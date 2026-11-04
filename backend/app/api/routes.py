@@ -1,14 +1,14 @@
 from datetime import datetime, timezone, timedelta
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile, File, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, or_
 import jwt, fitz, re
 from app.core.database import get_db
 from app.core.security import hash_password, verify_password, create_token, decode_token
 from app.core.config import settings
-from app.models.entities import User, Role, Exam, ExamStatus, Question, Attempt, AccessGrant, PermissionGrant, HistoricalResult, SiteContent
-from app.schemas.api import RegisterIn, LoginIn, UserOut, ExamIn, QuestionIn, AnswerIn, GrantIn, PermissionIn, PDFCreateExamIn, SiteContentUpdate, ScheduleUpdate, ExtendTimeIn, AnswerKeyApplyIn
+from app.models.entities import User, Role, Exam, ExamStatus, Question, Attempt, AccessGrant, PermissionGrant, HistoricalResult, SiteContent, LeaderboardEntry, LeaderboardExclusion
+from app.schemas.api import RegisterIn, LoginIn, UserOut, ExamIn, QuestionIn, AnswerIn, GrantIn, PermissionIn, PDFCreateExamIn, SiteContentUpdate, ScheduleUpdate, ExtendTimeIn, AnswerKeyApplyIn, DurationUpdate, CreateManagedUserIn, UserStatusUpdate, UserRoleUpdate, LeaderboardEntryCreate, LeaderboardRemoveIn
 from app.services.pdf_exam_parser import parse_exam_pdf, OCRUnavailableError, OCRServiceError
 from app.services.answer_key_parser import extract_answer_key_file
 from app.services.cloudinary_images import InvalidProfileImage, validate_image_bytes, upload_image, delete_image
@@ -135,7 +135,7 @@ def register(data:RegisterIn, db:Session=Depends(get_db)):
 def login(data:LoginIn,response:Response,db:Session=Depends(get_db)):
     user=db.query(User).filter(func.lower(User.email)==data.email.lower()).first()
     if not user or not verify_password(data.password,user.password_hash) or not user.active: raise HTTPException(401,"Invalid credentials")
-    response.set_cookie("access_token",create_token(user.id,user.role.value),httponly=True,secure=settings.cookie_secure,samesite="lax",max_age=settings.access_token_minutes*60,path="/")
+    response.set_cookie("access_token",create_token(user.id,user.role.value),httponly=True,secure=(settings.cookie_secure or settings.environment.lower() in {"production", "prod"}),samesite="lax",max_age=settings.access_token_minutes*60,path="/")
     return {"user":UserOut.model_validate(user).model_dump(),"message":"Logged in"}
 
 @router.post("/auth/logout")
@@ -241,6 +241,111 @@ def create_moderator(data:RegisterIn,db:Session=Depends(get_db),user:User=Depend
     u=User(email=data.email.lower(),full_name=data.full_name,password_hash=hash_password(data.password),role=Role.moderator)
     db.add(u); db.commit(); db.refresh(u); return UserOut.model_validate(u)
 
+@router.get("/admin/users")
+def list_admin_users(
+    role: str | None = Query(default=None),
+    search: str = Query(default="", max_length=160),
+    include_inactive: bool = Query(default=True),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    if user.role != Role.admin:
+        raise HTTPException(403, "Admin only")
+    query = db.query(User).filter(User.role.in_([Role.student, Role.moderator]))
+    if role:
+        if role not in (Role.student.value, Role.moderator.value):
+            raise HTTPException(422, "Role must be student or moderator")
+        query = query.filter(User.role == Role(role))
+    if not include_inactive:
+        query = query.filter(User.active.is_(True))
+    if search.strip():
+        term = f"%{search.strip().lower()}%"
+        query = query.filter(or_(func.lower(User.full_name).like(term), func.lower(User.email).like(term)))
+    rows = query.order_by(User.created_at.desc()).limit(1000).all()
+    return [{
+        "id": item.id, "full_name": item.full_name, "email": item.email,
+        "role": item.role.value, "active": item.active,
+        "avatar_url": item.avatar_url,
+        "created_at": _as_utc(item.created_at).isoformat() if item.created_at else None,
+    } for item in rows]
+
+
+@router.post("/admin/users", status_code=201, response_model=UserOut)
+def create_managed_user(data: CreateManagedUserIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    if user.role != Role.admin:
+        raise HTTPException(403, "Admin only")
+    email = data.email.lower()
+    if db.query(User).filter(func.lower(User.email) == email).first():
+        raise HTTPException(409, "Email already registered")
+    created = User(
+        email=email, full_name=data.full_name.strip(),
+        password_hash=hash_password(data.password), role=Role(data.role), active=True,
+    )
+    db.add(created)
+    db.commit()
+    db.refresh(created)
+    return created
+
+
+@router.patch("/admin/users/{user_id}/status")
+def update_managed_user_status(user_id: str, data: UserStatusUpdate, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    if user.role != Role.admin:
+        raise HTTPException(403, "Admin only")
+    target = db.get(User, user_id)
+    if not target or target.role == Role.admin:
+        raise HTTPException(404, "Student or moderator not found")
+    target.active = data.active
+    db.commit()
+    return {"id": target.id, "active": target.active, "message": "Account access updated."}
+
+
+@router.patch("/admin/users/{user_id}/role")
+def update_managed_user_role(user_id: str, data: UserRoleUpdate, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    if user.role != Role.admin:
+        raise HTTPException(403, "Admin only")
+    target = db.get(User, user_id)
+    if not target or target.role == Role.admin:
+        raise HTTPException(404, "Student or moderator not found")
+    new_role = Role(data.role)
+    if target.role == new_role:
+        return {"id": target.id, "role": target.role.value, "message": "Role is already set."}
+    if new_role == Role.student:
+        db.query(PermissionGrant).filter_by(moderator_id=target.id).delete(synchronize_session=False)
+    target.role = new_role
+    db.commit()
+    return {"id": target.id, "role": target.role.value, "message": "User role updated. Newly promoted moderators have no permissions until the admin grants them."}
+
+
+@router.delete("/admin/users/{user_id}")
+def remove_managed_user(user_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """Permanently remove a student/moderator and their personal exam attempts."""
+    if user.role != Role.admin:
+        raise HTTPException(403, "Admin only")
+    target = db.get(User, user_id)
+    if not target or target.role == Role.admin:
+        raise HTTPException(404, "Student or moderator not found")
+    if target.id == user.id:
+        raise HTTPException(409, "You cannot remove your own administrator account")
+
+    # Preserve exams and administrative records created by the removed account.
+    db.query(Exam).filter_by(created_by=target.id).update({Exam.created_by: user.id}, synchronize_session=False)
+    db.query(SiteContent).filter_by(updated_by=target.id).update({SiteContent.updated_by: user.id}, synchronize_session=False)
+    db.query(HistoricalResult).filter_by(imported_by=target.id).update({HistoricalResult.imported_by: user.id}, synchronize_session=False)
+    db.query(PermissionGrant).filter_by(granted_by=target.id).update({PermissionGrant.granted_by: user.id}, synchronize_session=False)
+    db.query(LeaderboardEntry).filter_by(created_by=target.id).update({LeaderboardEntry.created_by: user.id}, synchronize_session=False)
+    db.query(LeaderboardExclusion).filter_by(created_by=target.id).update({LeaderboardExclusion.created_by: user.id}, synchronize_session=False)
+
+    # Remove user-linked records and attempts so deleted users no longer appear in rankings.
+    db.query(PermissionGrant).filter_by(moderator_id=target.id).delete(synchronize_session=False)
+    db.query(AccessGrant).filter_by(student_id=target.id).delete(synchronize_session=False)
+    db.query(Attempt).filter_by(student_id=target.id).delete(synchronize_session=False)
+    db.query(LeaderboardEntry).filter_by(student_id=target.id).delete(synchronize_session=False)
+    db.query(LeaderboardExclusion).filter_by(student_id=target.id).delete(synchronize_session=False)
+    db.delete(target)
+    db.commit()
+    return {"removed": True, "message": "Account and its personal exam attempts were removed."}
+
+
 @router.post("/exams",status_code=201)
 def create_exam(data:ExamIn,db:Session=Depends(get_db),user:User=Depends(current_user)):
     require(user,db,"exam.create")
@@ -251,7 +356,7 @@ def create_exam(data:ExamIn,db:Session=Depends(get_db),user:User=Depends(current
     exam=Exam(**values,created_by=user.id); db.add(exam); db.commit(); db.refresh(exam); return exam_out(exam)
 
 def exam_out(e):
-    return {"id":e.id,"title":e.title,"description":e.description,"subject":e.subject,"status":e.status.value,"access_mode":e.access_mode,"duration_seconds":e.duration_seconds,"max_attempts":e.max_attempts,"pass_marks":e.pass_marks,"chapter":e.chapter,"set_name":e.set_name,"declared_question_count":e.declared_question_count,"source_file_name":e.source_file_name,"scheduled_start_at":_as_utc(e.scheduled_start_at).isoformat() if e.scheduled_start_at else None,"scheduled_end_at":_as_utc(e.scheduled_end_at).isoformat() if e.scheduled_end_at else None,"time_extension_seconds":e.time_extension_seconds or 0,"question_count":len(e.questions)}
+    return {"id":e.id,"title":e.title,"description":e.description,"subject":e.subject,"status":e.status.value,"access_mode":e.access_mode,"duration_seconds":e.duration_seconds,"max_attempts":e.max_attempts,"pass_marks":e.pass_marks,"chapter":e.chapter,"set_name":e.set_name,"paper":e.paper,"declared_question_count":e.declared_question_count,"source_file_name":e.source_file_name,"scheduled_start_at":_as_utc(e.scheduled_start_at).isoformat() if e.scheduled_start_at else None,"scheduled_end_at":_as_utc(e.scheduled_end_at).isoformat() if e.scheduled_end_at else None,"time_extension_seconds":e.time_extension_seconds or 0,"question_count":len(e.questions)}
 
 @router.get("/public/exams")
 def public_exams(db:Session=Depends(get_db)):
@@ -530,6 +635,37 @@ def extend_exam_time(exam_id:str,data:ExtendTimeIn,db:Session=Depends(get_db),us
     db.commit(); db.refresh(exam)
     return {**exam_out(exam),"added_minutes":data.minutes,"message":"Examination duration extended successfully"}
 
+@router.patch("/exams/{exam_id}/duration")
+def update_exam_duration(exam_id: str, data: DurationUpdate, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """Set an absolute exam duration; admins may increase or reduce it while live."""
+    if user.role != Role.admin:
+        raise HTTPException(403, "Only the site admin can change an examination's total duration")
+    exam = db.query(Exam).filter(Exam.id == exam_id).with_for_update().first()
+    if not exam:
+        raise HTTPException(404, "Exam not found")
+    if exam.status not in [ExamStatus.draft, ExamStatus.published, ExamStatus.live, ExamStatus.paused]:
+        raise HTTPException(409, "Duration cannot be changed after the examination has ended")
+    old_seconds = int(exam.duration_seconds)
+    new_seconds = int(data.duration_minutes) * 60
+    delta = new_seconds - old_seconds
+    exam.duration_seconds = new_seconds
+    if delta > 0:
+        exam.time_extension_seconds = int(exam.time_extension_seconds or 0) + delta
+    if exam.scheduled_end_at:
+        exam.scheduled_end_at = _as_utc(exam.scheduled_end_at) + timedelta(seconds=delta)
+    db.flush()
+    active_attempts = db.query(Attempt).filter_by(exam_id=exam.id, status="in_progress").all()
+    expired_attempts = sum(1 for attempt in active_attempts if _remaining_seconds(exam, attempt) <= 0)
+    db.commit()
+    db.refresh(exam)
+    return {
+        **exam_out(exam), "previous_duration_seconds": old_seconds,
+        "duration_change_seconds": delta, "active_attempts": len(active_attempts),
+        "attempts_now_out_of_time": expired_attempts,
+        "message": "Examination duration updated successfully.",
+    }
+
+
 @router.post("/exams/{exam_id}/access")
 def grant_access(exam_id:str,data:GrantIn,db:Session=Depends(get_db),user:User=Depends(current_user)):
     require(user,db,"student.manage")
@@ -602,16 +738,270 @@ def submit_attempt(attempt_id:str,db:Session=Depends(get_db),user:User=Depends(c
     a.score=max(0,score); a.status="submitted"; a.submitted_at=datetime.now(timezone.utc); db.commit()
     return {"score":a.score,"max_score":a.max_score,"status":a.status}
 
+def _normalize_paper(value: str | None) -> str | None:
+    if not value:
+        return None
+    raw = value.strip().casefold()
+    if any(token in raw for token in ("2nd", "second", "দ্বিতীয়", "দ্বিতীয়", "২য়", "২য়", "২য় পত্র", "paper 2")):
+        return "2nd Paper"
+    if any(token in raw for token in ("1st", "first", "প্রথম", "১ম", "paper 1")):
+        return "1st Paper"
+    return None
+
+
+def _exam_paper(exam: Exam) -> str | None:
+    explicit = _normalize_paper(exam.paper)
+    if explicit:
+        return explicit
+    haystack = " ".join(str(value or "") for value in (exam.title, exam.subject, exam.chapter, exam.set_name))
+    return _normalize_paper(haystack)
+
+
+def _leaderboard_scope_matches(scope: str, exam: Exam, exam_id: str | None, paper: str | None, subject: str | None) -> bool:
+    if scope == "exam":
+        return exam.id == exam_id
+    if scope == "paper":
+        return _exam_paper(exam) == paper and (not subject or exam.subject.strip().casefold() == subject.strip().casefold())
+    return exam.subject.strip().casefold() == (subject or "").strip().casefold()
+
+
+def _entry_matches_scope(entry: LeaderboardEntry, scope: str, exam_id: str | None, paper: str | None, subject: str | None) -> bool:
+    if entry.scope != scope:
+        return False
+    if scope == "exam":
+        return entry.exam_id == exam_id
+    if scope == "paper":
+        return entry.paper == paper and (not subject or (entry.subject or "").strip().casefold() == subject.strip().casefold())
+    return (entry.subject or "").strip().casefold() == (subject or "").strip().casefold()
+
+
+def _build_leaderboard_rows(db: Session, scope: str, exam_id: str | None = None, paper: str | None = None, subject: str | None = None):
+    matching_exams = [exam for exam in db.query(Exam).all() if _leaderboard_scope_matches(scope, exam, exam_id, paper, subject)]
+    exam_map = {exam.id: exam for exam in matching_exams}
+    if scope == "exam" and exam_id not in exam_map:
+        raise HTTPException(404, "Examination not found")
+
+    exclusions = db.query(LeaderboardExclusion).filter_by(scope=scope).all()
+    excluded_ids = set()
+    for item in exclusions:
+        if scope == "exam" and item.exam_id == exam_id:
+            excluded_ids.add(item.student_id)
+        elif scope == "paper" and item.paper == paper and (not subject or (item.subject or "").casefold() == subject.casefold()):
+            excluded_ids.add(item.student_id)
+        elif scope == "subject" and (item.subject or "").casefold() == (subject or "").casefold():
+            excluded_ids.add(item.student_id)
+
+    attempt_rows = []
+    if exam_map:
+        attempt_rows = db.query(Attempt, User, Exam).join(User, User.id == Attempt.student_id).join(Exam, Exam.id == Attempt.exam_id).filter(
+            Attempt.exam_id.in_(list(exam_map.keys())),
+            Attempt.status == "submitted", User.active.is_(True), User.role == Role.student,
+        ).all()
+    best_per_exam_student = {}
+    question_cache = {}
+    for attempt, student, exam in attempt_rows:
+        if exam.id not in exam_map or student.id in excluded_ids:
+            continue
+        if exam.id not in question_cache:
+            question_cache[exam.id] = db.query(Question).filter_by(exam_id=exam.id).order_by(Question.position).all()
+        questions = question_cache[exam.id]
+        answer_map = {item.get("question_id"): item.get("answer", {}) for item in (attempt.answers or []) if isinstance(item, dict)}
+        answered_questions = [question for question in questions if question.id in answer_map]
+        correct_count = sum(1 for question in answered_questions if evaluate(question, answer_map[question.id]))
+        performance = {
+            "attempt": attempt, "student": student, "exam": exam,
+            "correct_count": correct_count, "answered_count": len(answered_questions),
+            "total_questions": len(questions),
+            "max_score": float(attempt.max_score or sum(float(question.marks or 0) for question in questions)),
+        }
+        key = (student.id, exam.id)
+        current = best_per_exam_student.get(key)
+        current_score = float(current["attempt"].score or 0) if current else -1
+        candidate_score = float(attempt.score or 0)
+        current_accuracy = (current["correct_count"] / current["answered_count"]) if current and current["answered_count"] else 0
+        candidate_accuracy = correct_count / len(answered_questions) if answered_questions else 0
+        if current is None or (candidate_score, candidate_accuracy) > (current_score, current_accuracy):
+            best_per_exam_student[key] = performance
+
+    aggregated = {}
+    for (student_id, _exam_id), item in best_per_exam_student.items():
+        student = item["student"]
+        row = aggregated.setdefault(student_id, {
+            "id": f"attempt:{student_id}", "student_id": student_id,
+            "student": student.full_name, "email": student.email,
+            "score": 0.0, "max_score": 0.0, "correct_count": 0,
+            "answered_count": 0, "total_questions": 0, "exam_count": 0, "source": "attempt",
+            "submitted_at": None,
+        })
+        row["score"] += float(item["attempt"].score or 0)
+        row["max_score"] += float(item["max_score"] or 0)
+        row["correct_count"] += int(item["correct_count"])
+        row["answered_count"] += int(item["answered_count"])
+        row["total_questions"] += int(item["total_questions"])
+        row["exam_count"] += 1
+        submitted = _as_utc(item["attempt"].submitted_at)
+        if submitted and (row["submitted_at"] is None or submitted < row["submitted_at"]):
+            row["submitted_at"] = submitted
+
+    manual_entries = db.query(LeaderboardEntry).all()
+    for entry in manual_entries:
+        if not _entry_matches_scope(entry, scope, exam_id, paper, subject):
+            continue
+        if entry.student_id and entry.student_id in excluded_ids:
+            continue
+        linked_user = db.get(User, entry.student_id) if entry.student_id else None
+        if linked_user and not linked_user.active:
+            continue
+        identity = entry.student_id
+        manual_score = float(entry.score or 0)
+        if identity:
+            row = aggregated.get(identity)
+            if row is None:
+                row = {
+                    "id": identity, "entry_id": entry.id, "student_id": identity,
+                    "student": linked_user.full_name if linked_user else entry.display_name,
+                    "email": linked_user.email if linked_user else (entry.student_identifier or ""),
+                    "score": manual_score, "max_score": float(entry.max_score or 0),
+                    "correct_count": 0, "answered_count": 0, "total_questions": 0, "exam_count": 0,
+                    "source": "manual", "submitted_at": _as_utc(entry.created_at),
+                    "manual_accuracy": (manual_score / float(entry.max_score) * 100) if entry.max_score else None,
+                }
+                aggregated[identity] = row
+            else:
+                if manual_score > float(row["score"]):
+                    row["score"] = manual_score
+                    row["max_score"] = float(entry.max_score or 0)
+                    row["correct_count"] = 0
+                    row["answered_count"] = 0
+                    row["total_questions"] = 0
+                    row["manual_accuracy"] = (manual_score / float(entry.max_score) * 100) if entry.max_score else None
+                row["source"] = "combined"
+                row["manual_entry_id"] = entry.id
+                if entry.student_identifier:
+                    row["student_identifier"] = entry.student_identifier
+        else:
+            row_id = f"manual:{entry.id}"
+            aggregated[row_id] = {
+                "id": row_id, "entry_id": entry.id, "student_id": None,
+                "student": entry.display_name, "email": entry.student_identifier or "",
+                "score": manual_score, "max_score": float(entry.max_score or 0),
+                "correct_count": 0, "answered_count": 0, "total_questions": 0, "exam_count": 0,
+                "source": "manual", "submitted_at": _as_utc(entry.created_at),
+                "manual_accuracy": (manual_score / float(entry.max_score) * 100) if entry.max_score else None,
+            }
+
+    rows = list(aggregated.values())
+    for row in rows:
+        row["accuracy"] = round((row["correct_count"] / row["total_questions"] * 100), 2) if row["total_questions"] else (
+            round(row["manual_accuracy"], 2) if row.get("manual_accuracy") is not None else None
+        )
+        row["score"] = round(float(row["score"]), 2)
+        row["max_score"] = round(float(row["max_score"]), 2) if row["max_score"] else None
+        row["submitted_at"] = row["submitted_at"].isoformat() if row["submitted_at"] else None
+    rows.sort(key=lambda row: (-row["score"], -(row["accuracy"] or 0), row["student"].casefold()))
+    for rank, row in enumerate(rows, start=1):
+        row["rank"] = rank
+    return rows
+
+
 @router.get("/exams/{exam_id}/leaderboard")
-def leaderboard(exam_id:str,db:Session=Depends(get_db),user:User=Depends(current_user)):
-    e=db.get(Exam,exam_id)
-    if not e or e.status not in [ExamStatus.results_published,ExamStatus.archived]: raise HTTPException(403,"Results not published")
-    rows=db.query(Attempt,User).join(User,User.id==Attempt.student_id).filter(Attempt.exam_id==exam_id,Attempt.status=="submitted").order_by(Attempt.score.desc(),Attempt.submitted_at.asc()).limit(500).all()
-    best={}
-    for a,u in rows:
-        if u.id not in best: best[u.id]={"student":u.full_name,"score":a.score,"submitted_at":a.submitted_at}
-    result=sorted(best.values(),key=lambda x:(-x["score"],x["submitted_at"] or datetime.max.replace(tzinfo=timezone.utc)))
-    return [{"rank":i+1,"student":x["student"],"score":x["score"]} for i,x in enumerate(result)]
+def leaderboard(exam_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    exam = db.get(Exam, exam_id)
+    if not exam or exam.status not in [ExamStatus.results_published, ExamStatus.archived]:
+        raise HTTPException(403, "Results not published")
+    rows = _build_leaderboard_rows(db, "exam", exam_id=exam_id)
+    return [{"rank": row["rank"], "student": row["student"], "score": row["score"], "max_score": row["max_score"], "accuracy": row["accuracy"]} for row in rows]
+
+
+@router.get("/admin/leaderboards")
+def get_admin_leaderboard(
+    scope: str = Query(default="exam"), exam_id: str | None = None,
+    paper: str | None = None, subject: str | None = None,
+    db: Session = Depends(get_db), user: User = Depends(current_user),
+):
+    if user.role != Role.admin:
+        raise HTTPException(403, "Admin only")
+    if scope not in ("exam", "paper", "subject"):
+        raise HTTPException(422, "Scope must be exam, paper or subject")
+    normalized_paper = _normalize_paper(paper) if paper else None
+    if scope == "exam" and not exam_id:
+        raise HTTPException(422, "Select an examination")
+    if scope == "paper" and not normalized_paper:
+        raise HTTPException(422, "Select 1st Paper or 2nd Paper")
+    if scope == "subject" and not (subject or "").strip():
+        raise HTTPException(422, "Select a subject")
+    rows = _build_leaderboard_rows(db, scope, exam_id=exam_id, paper=normalized_paper, subject=subject)
+    return {"scope": scope, "exam_id": exam_id, "paper": normalized_paper, "subject": subject, "total": len(rows), "rows": rows}
+
+
+@router.post("/admin/leaderboards/entries", status_code=201)
+def create_admin_leaderboard_entry(data: LeaderboardEntryCreate, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    if user.role != Role.admin:
+        raise HTTPException(403, "Admin only")
+    exam = db.get(Exam, data.exam_id) if data.exam_id else None
+    if data.scope == "exam" and not exam:
+        raise HTTPException(404, "Examination not found")
+    identifier = (data.student_identifier or "").strip()
+    linked_student = None
+    if identifier:
+        linked_student = db.query(User).filter(
+            User.role == Role.student,
+            or_(func.lower(User.email) == identifier.lower(), func.lower(User.full_name) == identifier.lower(), User.id == identifier),
+        ).first()
+        if linked_student and not linked_student.active:
+            raise HTTPException(409, "The matched student account is blocked")
+    paper_value = _normalize_paper(data.paper) if data.paper else None
+    subject_value = (data.subject or (exam.subject if exam else "")).strip() or None
+    entry = LeaderboardEntry(
+        scope=data.scope, display_name=data.display_name.strip(),
+        student_identifier=identifier or None, student_id=linked_student.id if linked_student else None,
+        exam_id=exam.id if exam else None, paper=paper_value,
+        subject=subject_value, score=float(data.score), max_score=float(data.max_score) if data.max_score is not None else None,
+        created_by=user.id,
+    )
+    db.add(entry)
+    if linked_student:
+        exclusions = db.query(LeaderboardExclusion).filter_by(scope=data.scope, student_id=linked_student.id).all()
+        for exclusion in exclusions:
+            same_target = (data.scope == "exam" and exclusion.exam_id == data.exam_id) or (data.scope == "paper" and exclusion.paper == paper_value and (not subject_value or (exclusion.subject or "").casefold() == subject_value.casefold())) or (data.scope == "subject" and (exclusion.subject or "").casefold() == (subject_value or "").casefold())
+            if same_target:
+                db.delete(exclusion)
+    db.commit()
+    db.refresh(entry)
+    return {"id": entry.id, "display_name": entry.display_name, "scope": entry.scope, "message": "Leaderboard entry added and will be ranked automatically."}
+
+
+@router.post("/admin/leaderboards/remove")
+def remove_admin_leaderboard_entry(data: LeaderboardRemoveIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    if user.role != Role.admin:
+        raise HTTPException(403, "Admin only")
+    entry = db.get(LeaderboardEntry, data.entry_id) if data.entry_id else None
+    student_id = data.student_id or (entry.student_id if entry else None)
+    if data.entry_id and (not entry or not _entry_matches_scope(entry, data.scope, data.exam_id, _normalize_paper(data.paper) if data.paper else None, data.subject)):
+        raise HTTPException(404, "Leaderboard entry not found")
+    if student_id:
+        student = db.get(User, student_id)
+        if not student:
+            raise HTTPException(404, "Student not found")
+        normalized_paper = _normalize_paper(data.paper) if data.paper else None
+        existing = db.query(LeaderboardExclusion).filter_by(scope=data.scope, student_id=student_id).all()
+        already_excluded = any(
+            (data.scope == "exam" and item.exam_id == data.exam_id) or
+            (data.scope == "paper" and item.paper == normalized_paper and (not data.subject or (item.subject or "").casefold() == data.subject.casefold())) or
+            (data.scope == "subject" and (item.subject or "").casefold() == (data.subject or "").casefold())
+            for item in existing
+        )
+        if not already_excluded:
+            db.add(LeaderboardExclusion(scope=data.scope, student_id=student_id, exam_id=data.exam_id if data.scope == "exam" else None,
+                paper=normalized_paper if data.scope == "paper" else None, subject=data.subject if data.scope in ("paper", "subject") else None, created_by=user.id))
+        manual = db.query(LeaderboardEntry).filter_by(student_id=student_id, scope=data.scope).all()
+        for item in manual:
+            if _entry_matches_scope(item, data.scope, data.exam_id, normalized_paper, data.subject):
+                db.delete(item)
+    elif entry:
+        db.delete(entry)
+    db.commit()
+    return {"removed": True, "message": "The selected name was removed from this leaderboard."}
 
 @router.post("/exams/{exam_id}/publish-results")
 def publish_results(exam_id:str,db:Session=Depends(get_db),user:User=Depends(current_user)):
@@ -672,7 +1062,7 @@ def create_exam_from_pdf(data:PDFCreateExamIn,db:Session=Depends(get_db),user:Us
         if missing: raise HTTPException(422,{"message":"Set a correct answer for every question before publishing.","questions_missing_answer_key":missing})
     exam=Exam(
         title=title, description="Created from a reviewed PDF import.", subject=data.subject.strip() or "General",
-        chapter=data.chapter, set_name=data.set_name, declared_question_count=data.declared_question_count, source_file_name=data.source_file_name,
+        chapter=data.chapter, set_name=data.set_name, paper=data.paper, declared_question_count=data.declared_question_count, source_file_name=data.source_file_name,
         duration_seconds=data.duration_minutes*60, max_attempts=data.max_attempts,
         pass_marks=0, access_mode=data.access_mode, created_by=user.id,
         status=ExamStatus.published if data.publish_immediately else ExamStatus.draft,

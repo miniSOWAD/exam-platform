@@ -42,6 +42,7 @@ class Exam(Base):
     subject: Mapped[str]=mapped_column(String(100), default="General")
     chapter: Mapped[str|None]=mapped_column(String(220), nullable=True)
     set_name: Mapped[str|None]=mapped_column(String(100), nullable=True)
+    paper: Mapped[str|None]=mapped_column(String(40), nullable=True, index=True)
     declared_question_count: Mapped[int|None]=mapped_column(Integer, nullable=True)
     source_file_name: Mapped[str|None]=mapped_column(String(255), nullable=True)
     status: Mapped[ExamStatus]=mapped_column(Enum(ExamStatus), default=ExamStatus.draft, index=True)
@@ -104,6 +105,36 @@ class HistoricalResult(Base):
     score: Mapped[float]=mapped_column(Float)
     max_score: Mapped[float]=mapped_column(Float)
     imported_by: Mapped[str]=mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=now)
+
+
+class LeaderboardEntry(Base):
+    """Admin-entered historical/manual score that can be ranked with live results."""
+    __tablename__="leaderboard_entries"
+    id: Mapped[str]=mapped_column(String(36), primary_key=True, default=uid)
+    scope: Mapped[str]=mapped_column(String(20), index=True)  # exam, paper, subject
+    display_name: Mapped[str]=mapped_column(String(160))
+    student_identifier: Mapped[str|None]=mapped_column(String(255), nullable=True)
+    student_id: Mapped[str|None]=mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    exam_id: Mapped[str|None]=mapped_column(ForeignKey("exams.id", ondelete="SET NULL"), nullable=True, index=True)
+    paper: Mapped[str|None]=mapped_column(String(40), nullable=True, index=True)
+    subject: Mapped[str|None]=mapped_column(String(100), nullable=True, index=True)
+    score: Mapped[float]=mapped_column(Float)
+    max_score: Mapped[float|None]=mapped_column(Float, nullable=True)
+    created_by: Mapped[str]=mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=now)
+
+
+class LeaderboardExclusion(Base):
+    """Admin exclusion for a real student in a specific leaderboard scope."""
+    __tablename__="leaderboard_exclusions"
+    id: Mapped[str]=mapped_column(String(36), primary_key=True, default=uid)
+    scope: Mapped[str]=mapped_column(String(20), index=True)
+    student_id: Mapped[str]=mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    exam_id: Mapped[str|None]=mapped_column(ForeignKey("exams.id", ondelete="CASCADE"), nullable=True, index=True)
+    paper: Mapped[str|None]=mapped_column(String(40), nullable=True, index=True)
+    subject: Mapped[str|None]=mapped_column(String(100), nullable=True, index=True)
+    created_by: Mapped[str]=mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=now)
 
 

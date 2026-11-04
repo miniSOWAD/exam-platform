@@ -4,7 +4,7 @@ import { ChangeEvent, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { ArrowLeft, Camera, CheckCircle2, ImagePlus, Trash2, UploadCloud, UserRound } from 'lucide-react';
-import { api } from '@/lib/api';
+import { api, isUnauthorizedError } from '@/lib/api';
 
 type User = { id: string; email: string; full_name: string; role: string; avatar_url?: string | null };
 const MAX_PHOTO_BYTES = 300 * 1024;
@@ -17,10 +17,15 @@ export default function ProfilePage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     let active = true;
-    api<User>('/auth/me').then((data) => { if (active) setUser(data); }).catch(() => router.replace('/login'));
+    api<User>('/auth/me').then((data) => { if (active) setUser(data); }).catch((error: unknown) => {
+      if (!active) return;
+      if (isUnauthorizedError(error)) router.replace('/login?next=%2Fdashboard%2Fprofile');
+      else setError(error instanceof Error ? error.message : 'Could not load your profile.');
+    }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [router]);
 
@@ -67,7 +72,8 @@ export default function ProfilePage() {
     finally { setBusy(false); }
   }
 
-  if (!user) return <main className="container-shell py-20">Loading your profile…</main>;
+  if (loading) return <main className="container-shell py-20">Loading your profile…</main>;
+  if (!user) return <main className="container-shell py-20"><p role="alert" className="text-sm text-red-700">{error || 'Your profile could not be loaded.'}</p></main>;
 
   return <main className="container-shell max-w-4xl py-10">
     <Link href="/dashboard" className="inline-flex items-center gap-2 text-sm font-bold text-slate-500 hover:text-brand"><ArrowLeft size={16}/> Back to dashboard</Link>

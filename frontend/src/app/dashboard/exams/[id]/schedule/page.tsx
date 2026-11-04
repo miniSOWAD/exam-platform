@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { ArrowLeft, CalendarClock, Clock3, PlusCircle, Save } from 'lucide-react';
-import { api } from '@/lib/api';
+import { api, isUnauthorizedError } from '@/lib/api';
 
 type Exam = { id: string; title: string; subject: string; status: string; duration_seconds: number; scheduled_start_at?: string | null; scheduled_end_at?: string | null; time_extension_seconds?: number };
 type User = { role: string };
@@ -30,7 +30,26 @@ export default function ExamSchedulePage() {
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
 
-  useEffect(() => { let active = true; Promise.all([api<User>('/auth/me'), api<Exam>(`/exams/${id}`)]).then(([currentUser,currentExam]) => { if (!active) return; if (currentUser.role === 'student') { router.replace('/dashboard'); return; } setUser(currentUser); setExam(currentExam); setStartAt(toLocal(currentExam.scheduled_start_at)); setEndAt(toLocal(currentExam.scheduled_end_at)); }).catch(() => router.replace('/login')).finally(() => { if (active) setLoading(false); }); return () => { active = false; }; }, [id, router]);
+  useEffect(() => {
+    let active = true;
+    async function load() {
+      try {
+        const currentUser = await api<User>('/auth/me');
+        if (!active) return;
+        if (currentUser.role === 'student') { router.replace('/dashboard'); return; }
+        setUser(currentUser);
+        const currentExam = await api<Exam>(`/exams/${id}`);
+        if (!active) return;
+        setExam(currentExam); setStartAt(toLocal(currentExam.scheduled_start_at)); setEndAt(toLocal(currentExam.scheduled_end_at));
+      } catch (error) {
+        if (!active) return;
+        if (isUnauthorizedError(error)) router.replace(`/login?next=${encodeURIComponent(`/dashboard/exams/${id}/schedule`)}`);
+        else setError(error instanceof Error ? error.message : 'Could not load examination timing.');
+      } finally { if (active) setLoading(false); }
+    }
+    void load();
+    return () => { active = false; };
+  }, [id, router]);
 
   async function saveSchedule(event: FormEvent) {
     event.preventDefault(); setSaving(true); setError(''); setMessage('');
@@ -49,7 +68,8 @@ export default function ExamSchedulePage() {
     finally { setExtending(false); }
   }
 
-  if (loading || !user || !exam) return <main className="container-shell py-20">Loading examination timing…</main>;
+  if (loading) return <main className="container-shell py-20">Loading examination timing…</main>;
+  if (!user || !exam) return <main className="container-shell max-w-2xl py-20"><p role="alert" className="text-sm text-red-700">{error || 'Examination timing could not be loaded.'}</p><button type="button" className="btn mt-5" onClick={() => window.location.reload()}>Retry</button></main>;
   const canSchedule = ['draft','published'].includes(exam.status);
   const canExtend = ['published','live','paused'].includes(exam.status);
   return <main className="container-shell py-9">

@@ -4,7 +4,7 @@ import { ChangeEvent, FormEvent, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { ArrowLeft, CheckCircle2, Globe2, ImagePlus, Save, ShieldCheck, UserRound } from 'lucide-react';
-import { api } from '@/lib/api';
+import { api, isUnauthorizedError } from '@/lib/api';
 import { useSiteContent } from '@/components/SiteContentProvider';
 
 type FeatureCard = { label: string; title: string; description: string };
@@ -65,7 +65,11 @@ export default function SiteContentPage() {
       setUser(current); setSite({ ...defaults, ...content });
       setSubjectsText((content.subjects || []).join('\n'));
       setExpertiseText((content.owner_expertise || []).join('\n'));
-    }).catch(() => { if (active) router.replace('/login'); }).finally(() => { if (active) setLoading(false); });
+    }).catch((error: unknown) => {
+      if (!active) return;
+      if (isUnauthorizedError(error)) router.replace('/login?next=%2Fdashboard%2Fsite-content');
+      else setError(error instanceof Error ? error.message : 'Could not load website settings.');
+    }).finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [router]);
 
@@ -114,7 +118,8 @@ export default function SiteContentPage() {
     finally { setSaving(false); }
   }
 
-  if (loading || !user) return <main className="container-shell py-20">Loading website editor…</main>;
+  if (loading) return <main className="container-shell py-20">Loading website editor…</main>;
+  if (!user) return <main className="container-shell py-20"><p role="alert" className="text-sm text-red-700">{error || 'Website settings could not be loaded.'}</p></main>;
 
   return <main className="container-shell py-9">
     <Link href="/dashboard" className="inline-flex items-center gap-2 text-sm font-bold text-slate-500 hover:text-brand"><ArrowLeft size={16}/> Back to dashboard</Link>

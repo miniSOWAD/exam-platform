@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr, Field, ConfigDict
+from pydantic import BaseModel, EmailStr, Field, ConfigDict, model_validator
 from typing import Literal, Any
 from datetime import datetime
 
@@ -26,6 +26,7 @@ class ExamIn(BaseModel):
     subject: str = "General"
     chapter: str | None = None
     set_name: str | None = None
+    paper: Literal["1st Paper", "2nd Paper"] | None = None
     declared_question_count: int | None = Field(default=None, ge=0, le=10000)
     source_file_name: str | None = Field(default=None, max_length=255)
     duration_seconds: int = Field(default=3600, ge=60, le=86400)
@@ -56,6 +57,7 @@ class PDFCreateExamIn(BaseModel):
     subject: str = Field(default="General", max_length=100)
     chapter: str | None = Field(default=None, max_length=220)
     set_name: str | None = Field(default=None, max_length=100)
+    paper: Literal["1st Paper", "2nd Paper"] | None = None
     duration_minutes: int = Field(default=60, ge=1, le=1440)
     declared_question_count: int | None = Field(default=None, ge=0, le=10000)
     questions: list[ImportedQuestionIn] = Field(min_length=1, max_length=1000)
@@ -113,3 +115,66 @@ class AnswerKeyEntryIn(BaseModel):
 
 class AnswerKeyApplyIn(BaseModel):
     answers: list[AnswerKeyEntryIn] = Field(min_length=1, max_length=1000)
+
+
+class DurationUpdate(BaseModel):
+    duration_minutes: int = Field(ge=1, le=1440)
+
+
+class CreateManagedUserIn(BaseModel):
+    email: EmailStr
+    full_name: str = Field(min_length=2, max_length=160)
+    password: str = Field(min_length=10, max_length=128)
+    role: Literal["student", "moderator"]
+
+
+class UserStatusUpdate(BaseModel):
+    active: bool
+
+
+class UserRoleUpdate(BaseModel):
+    role: Literal["student", "moderator"]
+
+
+class LeaderboardEntryCreate(BaseModel):
+    scope: Literal["exam", "paper", "subject"]
+    display_name: str = Field(min_length=2, max_length=160)
+    student_identifier: str | None = Field(default=None, max_length=255)
+    exam_id: str | None = None
+    paper: Literal["1st Paper", "2nd Paper"] | None = None
+    subject: str | None = Field(default=None, max_length=100)
+    score: float = Field(ge=0)
+    max_score: float | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def validate_scope_target(self):
+        if self.scope == "exam" and not self.exam_id:
+            raise ValueError("Select an examination for an exam leaderboard entry")
+        if self.scope == "paper" and not self.paper:
+            raise ValueError("Select 1st Paper or 2nd Paper")
+        if self.scope == "subject" and not (self.subject or "").strip():
+            raise ValueError("Enter a subject for a subject leaderboard entry")
+        if self.max_score is not None and self.score > self.max_score:
+            raise ValueError("Acquired score cannot exceed maximum score")
+        return self
+
+
+class LeaderboardRemoveIn(BaseModel):
+    scope: Literal["exam", "paper", "subject"]
+    exam_id: str | None = None
+    paper: Literal["1st Paper", "2nd Paper"] | None = None
+    subject: str | None = Field(default=None, max_length=100)
+    student_id: str | None = None
+    entry_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_target(self):
+        if not self.student_id and not self.entry_id:
+            raise ValueError("A student or manual leaderboard entry is required")
+        if self.scope == "exam" and not self.exam_id:
+            raise ValueError("Exam ID is required")
+        if self.scope == "paper" and not self.paper:
+            raise ValueError("Paper is required")
+        if self.scope == "subject" and not (self.subject or "").strip():
+            raise ValueError("Subject is required")
+        return self

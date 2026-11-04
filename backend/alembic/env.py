@@ -1,6 +1,6 @@
 from logging.config import fileConfig
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import engine_from_config, pool, text
 from app.core.config import settings
 from app.core.database import Base
 from app.models import entities  # noqa: F401 - registers all models on Base.metadata
@@ -37,6 +37,14 @@ def run_migrations_online():
     with connectable.connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
         with context.begin_transaction():
+            # Multiple FastAPI Cloud instances can start at the same time.
+            # A transaction-scoped advisory lock prevents them racing to apply
+            # the same migration on PostgreSQL/Neon. SQLite needs no such lock.
+            if connection.dialect.name == "postgresql":
+                connection.execute(
+                    text("SELECT pg_advisory_xact_lock(:lock_key)"),
+                    {"lock_key": 0x4558464C4F57},
+                )
             context.run_migrations()
 
 
