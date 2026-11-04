@@ -106,3 +106,10 @@ class ScheduleUpdate(BaseModel):
 
 class ExtendTimeIn(BaseModel):
     minutes: int = Field(ge=1, le=1440)
+
+class AnswerKeyEntryIn(BaseModel):
+    question_number: int = Field(ge=1, le=10000)
+    option_indices: list[int] = Field(min_length=1, max_length=4)
+
+class AnswerKeyApplyIn(BaseModel):
+    answers: list[AnswerKeyEntryIn] = Field(min_length=1, max_length=1000)

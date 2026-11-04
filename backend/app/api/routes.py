@@ -8,8 +8,9 @@ from app.core.database import get_db
 from app.core.security import hash_password, verify_password, create_token, decode_token
 from app.core.config import settings
 from app.models.entities import User, Role, Exam, ExamStatus, Question, Attempt, AccessGrant, PermissionGrant, HistoricalResult, SiteContent
-from app.schemas.api import RegisterIn, LoginIn, UserOut, ExamIn, QuestionIn, AnswerIn, GrantIn, PermissionIn, PDFCreateExamIn, SiteContentUpdate, ScheduleUpdate, ExtendTimeIn
+from app.schemas.api import RegisterIn, LoginIn, UserOut, ExamIn, QuestionIn, AnswerIn, GrantIn, PermissionIn, PDFCreateExamIn, SiteContentUpdate, ScheduleUpdate, ExtendTimeIn, AnswerKeyApplyIn
 from app.services.pdf_exam_parser import parse_exam_pdf, OCRUnavailableError, OCRServiceError
+from app.services.answer_key_parser import extract_answer_key_file
 from app.services.cloudinary_images import InvalidProfileImage, validate_image_bytes, upload_image, delete_image
 from fastapi import Request
 
@@ -284,14 +285,14 @@ def get_questions(exam_id:str,db:Session=Depends(get_db),user:User=Depends(curre
     require(user,db,"question.manage")
     e=db.get(Exam,exam_id)
     if not e: raise HTTPException(404,"Exam not found")
-    return [safe_question(q) for q in db.query(Question).filter_by(exam_id=exam_id).order_by(Question.position).all()]
+    return [safe_question(q) for q in db.query(Question).filter_by(exam_id=exam_id).order_by(Question.position, Question.id).all()]
 
 
 @router.get("/exams/{exam_id}/questions/manage")
 def manage_exam_questions(exam_id:str,db:Session=Depends(get_db),user:User=Depends(current_user)):
     require(user,db,"question.manage")
     if not db.get(Exam,exam_id): raise HTTPException(404,"Exam not found")
-    rows=db.query(Question).filter_by(exam_id=exam_id).order_by(Question.position).all()
+    rows=db.query(Question).filter_by(exam_id=exam_id).order_by(Question.position, Question.id).all()
     return [{**safe_question(q),"answer_key":q.answer_key or {},"negative_marks":q.negative_marks} for q in rows]
 
 
@@ -306,6 +307,171 @@ def update_exam_question(exam_id:str,question_id:str,data:QuestionIn,db:Session=
     for field,value in data.model_dump().items(): setattr(question,field,value)
     db.commit(); db.refresh(question)
     return {**safe_question(question),"answer_key":question.answer_key or {},"negative_marks":question.negative_marks}
+
+def _answer_key_option_id(option, index: int) -> str:
+    if isinstance(option, dict):
+        return str(option.get("id") or option.get("key") or index)
+    return str(index)
+
+
+def _ensure_answer_key_editable(exam: Exam, db: Session) -> None:
+    if exam.status in [ExamStatus.live, ExamStatus.paused, ExamStatus.ended, ExamStatus.results_published, ExamStatus.archived]:
+        raise HTTPException(409, "Answer keys cannot be changed after an examination has started or ended.")
+    if db.query(Attempt).filter_by(exam_id=exam.id).count():
+        raise HTTPException(409, "Answer keys are locked because a student attempt has already started.")
+
+
+@router.post("/exams/{exam_id}/answer-key/preview")
+async def preview_exam_answer_key(
+    exam_id: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    """Parse a numbered answer-only TXT/PDF and preview question matches without saving."""
+    require(user, db, "question.manage")
+    exam = db.get(Exam, exam_id)
+    if not exam:
+        raise HTTPException(404, "Examination not found")
+    _ensure_answer_key_editable(exam, db)
+
+    filename = file.filename or "answer-key"
+    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if extension not in {"pdf", "txt"}:
+        raise HTTPException(415, "Upload an answer-key PDF or TXT file.")
+    max_bytes = (settings.max_pdf_upload_mb if extension == "pdf" else 2) * 1024 * 1024
+    raw = await file.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        limit = f"{settings.max_pdf_upload_mb} MB" if extension == "pdf" else "2 MB"
+        raise HTTPException(413, f"The answer-key file exceeds the {limit} upload limit.")
+
+    try:
+        parsed = await asyncio.to_thread(
+            extract_answer_key_file,
+            raw,
+            filename,
+            settings.ocr_space_api_key,
+            settings.ocr_space_engine,
+            settings.ocr_space_timeout_seconds,
+            30,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except OCRUnavailableError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except OCRServiceError as exc:
+        raise HTTPException(502, f"Answer-key OCR failed: {exc}") from exc
+
+    rows = db.query(Question).filter_by(exam_id=exam_id).order_by(Question.position, Question.id).all()
+    preview_answers = []
+    detected_numbers = set()
+    for entry in parsed["entries"]:
+        number = entry["question_number"]
+        detected_numbers.add(number)
+        indices = entry["option_indices"]
+        labels = entry["option_labels"]
+        status = "ready"
+        reason = None
+        current_labels = []
+
+        if number > len(rows):
+            status = "out_of_range"
+            reason = f"This examination has only {len(rows)} questions."
+        else:
+            question = rows[number - 1]
+            if question.kind not in ("mcq", "multiple_mcq"):
+                status = "unsupported_question_type"
+                reason = "This question is not an MCQ."
+            elif any(index >= len(question.options or []) for index in indices):
+                status = "invalid_option"
+                reason = "The answer refers to an option that does not exist for this question."
+            elif question.kind == "mcq" and len(set(indices)) > 1:
+                status = "conflict"
+                reason = "More than one different answer was supplied for a single-correct MCQ."
+            else:
+                selected = set(str(value) for value in ((question.answer_key or {}).get("selected_option_ids") or []))
+                for option_index, option in enumerate(question.options or []):
+                    if _answer_key_option_id(option, option_index) in selected:
+                        current_labels.append(chr(ord("A") + option_index))
+
+        preview_answers.append({
+            "question_number": number,
+            "option_labels": labels,
+            "option_indices": indices,
+            "status": status,
+            "reason": reason,
+            "current_option_labels": current_labels,
+        })
+
+    ready_count = sum(1 for item in preview_answers if item["status"] == "ready")
+    return {
+        "filename": filename,
+        "source_type": parsed["source_type"],
+        "ocr_used": parsed["ocr_used"],
+        "ocr_engine": parsed["ocr_engine"],
+        "pages": parsed["pages"],
+        "question_count": len(rows),
+        "detected_count": len(preview_answers),
+        "ready_count": ready_count,
+        "answers": preview_answers,
+        "missing_question_numbers": [number for number in range(1, len(rows) + 1) if number not in detected_numbers],
+    }
+
+
+@router.post("/exams/{exam_id}/answer-key/apply")
+def apply_exam_answer_key(
+    exam_id: str,
+    data: AnswerKeyApplyIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    """Apply validated option indices to the matching question serials atomically."""
+    require(user, db, "question.manage")
+    exam = db.get(Exam, exam_id)
+    if not exam:
+        raise HTTPException(404, "Examination not found")
+    _ensure_answer_key_editable(exam, db)
+
+    rows = db.query(Question).filter_by(exam_id=exam_id).order_by(Question.position, Question.id).all()
+    seen_numbers = set()
+    updates = []
+    for entry in data.answers:
+        number = entry.question_number
+        if number in seen_numbers:
+            raise HTTPException(422, f"Question {number} appears more than once in the answer-key import.")
+        seen_numbers.add(number)
+        if number > len(rows):
+            raise HTTPException(422, f"Question {number} does not exist in this examination.")
+        question = rows[number - 1]
+        if question.kind not in ("mcq", "multiple_mcq"):
+            raise HTTPException(422, f"Question {number} is not an MCQ and cannot receive an A/B/C/D answer.")
+        indices = entry.option_indices
+        if len(set(indices)) != len(indices):
+            raise HTTPException(422, f"Question {number} contains duplicate option labels.")
+        if question.kind == "mcq" and len(indices) != 1:
+            raise HTTPException(422, f"Question {number} is single-correct and must have exactly one answer.")
+        if any(index < 0 or index >= len(question.options or []) for index in indices):
+            raise HTTPException(422, f"Question {number} refers to an option that does not exist.")
+        option_ids = [_answer_key_option_id(question.options[index], index) for index in indices]
+        updates.append((number, question, option_ids))
+
+    try:
+        for _, question, option_ids in updates:
+            question.answer_key = {**(question.answer_key or {}), "selected_option_ids": option_ids}
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    refreshed_rows = db.query(Question).filter_by(exam_id=exam_id).order_by(Question.position, Question.id).all()
+    unanswered = [index + 1 for index, question in enumerate(refreshed_rows) if answer_key_missing(question)]
+    return {
+        "applied_count": len(updates),
+        "updated_question_numbers": [number for number, _, _ in updates],
+        "unanswered_question_numbers": unanswered,
+        "message": f"Answer keys updated for {len(updates)} question(s).",
+    }
+
 
 @router.post("/exams/{exam_id}/publish")
 def publish_exam(exam_id:str,db:Session=Depends(get_db),user:User=Depends(current_user)):
@@ -391,7 +557,7 @@ def attempt_questions(attempt_id:str,db:Session=Depends(get_db),user:User=Depend
     a=db.get(Attempt,attempt_id)
     if not a or (a.student_id!=user.id and user.role==Role.student): raise HTTPException(404,"Attempt not found")
     e=db.get(Exam,a.exam_id)
-    return [safe_question(q) for q in db.query(Question).filter_by(exam_id=e.id).order_by(Question.position).all()]
+    return [safe_question(q) for q in db.query(Question).filter_by(exam_id=e.id).order_by(Question.position, Question.id).all()]
 
 @router.get("/attempts/{attempt_id}")
 def get_attempt(attempt_id:str,db:Session=Depends(get_db),user:User=Depends(current_user)):
