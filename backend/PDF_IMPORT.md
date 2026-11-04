@@ -1,18 +1,16 @@
 # ExamFlow Bengali PDF import
 
-## What changed in v1.3.0
+## PDF preview behaviour
 
-- Uses page layout to split two-column question papers before OCR.
-- Reads the first-page heading separately to detect subject, chapter, exam title, set, and declared question count.
-- Supports Bengali question numbers and Bengali option labels `(ক)`, `(খ)`, `(গ)`, `(ঘ)`.
-- Supports option markers that OCR commonly confuses, including `€ক)`, `খে)`, `(A)`, `(1)`, and `(*)`.
-- Handles question numbers that OCR places on a separate line.
-- Runs alternate Tesseract page-segmentation passes only when a question block is incomplete.
-- Never guesses correct answers.
+- The parser first reads a PDF's embedded text layer. Digitally generated Bengali/English PDFs with recognizable question blocks are parsed locally without an external OCR call.
+- Native text is accepted only when question blocks and option coverage are sufficiently complete. If the embedded text is damaged or absent, the parser falls back to local Tesseract (`ben+eng`) or OCR.Space.
+- Page headers and footers are excluded from question parsing. Unruled two-column text layouts are detected from text-block positions when possible.
+- Bengali option labels `ক.`, `খ.`, `গ.`, `ঘ.`, their parenthesized forms, and common English A-D labels are supported, including multiple options on one line.
+- Correct answers are never inferred.
 
 ## FastAPI Cloud setup
 
-FastAPI Cloud's source build does not automatically install the Tesseract OS executable or Bengali language data. Configure these app environment variables for Bengali/scanned PDFs:
+FastAPI Cloud's standard source build may not include the Tesseract executable or Bengali language data. For scanned/image-only PDFs, configure these app environment variables:
 
 ```env
 OCR_SPACE_API_KEY=YOUR_OCR_SPACE_API_KEY
@@ -21,22 +19,26 @@ OCR_SPACE_TIMEOUT_SECONDS=90
 MAX_PDF_UPLOAD_MB=15
 ```
 
-Set the API key as a secret, then redeploy the app. The backend will prefer local Tesseract when it detects the executable and both `ben` and `eng` language packs; otherwise it uses OCR.Space Engine 3.
+Set the API key as an encrypted secret, then redeploy. If local Tesseract with both `ben` and `eng` is available, it is preferred. Otherwise, OCR.Space is used only when the PDF has no usable embedded text layer.
 
-OCR.Space receives rasterized page images for OCR. Do not enable the remote fallback for confidential question papers unless your document policy allows that provider to process the page images.
+OCR.Space receives rasterized page images. Do not enable remote OCR for confidential question papers unless your document policy allows that provider to process page images.
 
 ## Local setup
 
-- Install Tesseract OCR plus Bengali (`ben`) and English (`eng`) language data, or configure `OCR_SPACE_API_KEY` in `backend/.env`.
+- Install Tesseract OCR plus Bengali (`ben`) and English (`eng`) language data, or configure `OCR_SPACE_API_KEY` in `backend/.env` for image-only PDFs.
 - Install Python dependencies: `python -m pip install -r requirements.txt`.
-- Keep `MAX_UPLOAD_BYTES=307200` for profile photos. PDF uploads use the separate `MAX_PDF_UPLOAD_MB` setting.
+- `MAX_UPLOAD_BYTES=307200` is only for profile photos. PDF uploads use the separate `MAX_PDF_UPLOAD_MB` setting.
 
-## Deploy
+## API status codes
 
-From the `backend` directory:
+- `400`: unreadable or password-protected PDF.
+- `413`: PDF exceeds the upload-size limit.
+- `415`: file is not a PDF.
+- `422`: request validation failed before extraction (for example, a missing multipart `file` field).
+- `502`: OCR provider request failed or rejected the document.
+- `503`: no Bengali-capable OCR engine is configured for an image-only/damaged-text PDF.
+- `500`: unexpected internal extraction failure; inspect backend logs for the traceback.
 
-```powershell
-fastapi deploy
-```
+## Frontend proxy
 
-After deployment, verify `GET /api/v1/health`, then upload the supplied Bengali sample PDF through the ExamFlow PDF Exam Builder.
+Keep `NEXT_PUBLIC_API_URL=/api/v1`. Set `API_INTERNAL_URL` to the FastAPI origin only, for example `https://examflow-api.fastapicloud.dev`, with no trailing slash and no `/api/v1` suffix. Next.js also strips accidental trailing slashes before creating the rewrite.

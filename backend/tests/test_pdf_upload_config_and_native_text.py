@@ -4,7 +4,7 @@ import pytest
 from app.core.config import settings
 from app.services import pdf_exam_parser
 from app.services.pdf_exam_parser import (
-    PDFOCRUnavailableError,
+    OCRUnavailableError,
     _native_text_is_usable,
     parse_exam_pdf,
 )
@@ -15,31 +15,39 @@ def test_pdf_upload_limit_is_separate_from_avatar_limit():
     assert settings.max_upload_bytes <= 307200
 
 
-def test_bengali_native_text_with_question_markers_does_not_force_ocr():
+def test_native_text_helper_accepts_question_and_option_blocks():
     text = """পদার্থবিজ্ঞান ১ম পত্র — অধ্যায় ৪
 সেট ১
-১. একটি নমুনা প্রশ্ন কী?
-A. প্রথম উত্তর
-B. দ্বিতীয় উত্তর
-C. তৃতীয় উত্তর
-D. চতুর্থ উত্তর
+1. একটি নমুনা প্রশ্ন কী?
+ক. প্রথম উত্তর
+খ. দ্বিতীয় উত্তর
+গ. তৃতীয় উত্তর
+ঘ. চতুর্থ উত্তর
 """
     assert _native_text_is_usable(text)
 
 
-def test_blank_scanned_pdf_text_requires_ocr():
-    assert not _native_text_is_usable("\n\n\x0c")
-
-
-def test_digital_pdf_uses_native_text_without_ocr():
+def test_blank_scanned_pdf_text_requires_ocr(monkeypatch):
     doc = fitz.open()
-    page = doc.new_page()
-    page.insert_text((40, 40), "Physics chapter 4 set 1\n1. What is force?\nA. Push\nB. Pull\nC. Mass\nD. Power", fontsize=11)
+    doc.new_page()
     raw = doc.tobytes()
     doc.close()
-    result = parse_exam_pdf(raw, "sample.pdf")
+    monkeypatch.setattr(pdf_exam_parser, "_tesseract_ready", lambda: False)
+    with pytest.raises(OCRUnavailableError, match="OCR_SPACE_API_KEY"):
+        parse_exam_pdf(raw, "blank-scan.pdf")
+
+
+def test_supplied_hsc_biology_pdf_uses_native_text_and_detects_all_50_questions():
+    fixture = __import__("pathlib").Path(__file__).parent / "fixtures" / "hsc_biology_50q.pdf"
+    result = parse_exam_pdf(fixture.read_bytes(), fixture.name)
+
     assert result["ocr_used"] is False
-    assert result["question_count_detected"] == 1
+    assert result["ocr_engine"] == "embedded-text"
+    assert result["metadata"]["declared_question_count"] == 50
+    assert result["question_count_detected"] == 50
+    assert [question["number"] for question in result["questions"]] == list(range(1, 51))
+    assert all(len(question["options"]) == 4 for question in result["questions"])
+    assert not result["warnings"]
 
 
 def test_scanned_pdf_returns_actionable_error_without_cloud_ocr(monkeypatch):
@@ -47,7 +55,16 @@ def test_scanned_pdf_returns_actionable_error_without_cloud_ocr(monkeypatch):
     doc.new_page()
     raw = doc.tobytes()
     doc.close()
-    monkeypatch.setattr(pdf_exam_parser.shutil, "which", lambda _: None)
-    monkeypatch.setattr(pdf_exam_parser, "_local_tesseract_ready", lambda: False)
-    with pytest.raises(PDFOCRUnavailableError, match="OCR_SPACE_API_KEY"):
+    monkeypatch.setattr(pdf_exam_parser, "_tesseract_ready", lambda: False)
+    with pytest.raises(OCRUnavailableError, match="OCR_SPACE_API_KEY"):
         parse_exam_pdf(raw, "scan.pdf")
+
+
+def test_supplied_two_column_chemistry_pdf_uses_native_text_and_detects_100_questions():
+    fixture = __import__("pathlib").Path(__file__).parent / "fixtures" / "chemistry_two_column_100q.pdf"
+    result = parse_exam_pdf(fixture.read_bytes(), fixture.name)
+
+    assert result["ocr_used"] is False
+    assert result["question_count_detected"] == 100
+    assert [question["number"] for question in result["questions"]] == list(range(1, 101))
+    assert sum(len(question["options"]) == 4 for question in result["questions"]) >= 99

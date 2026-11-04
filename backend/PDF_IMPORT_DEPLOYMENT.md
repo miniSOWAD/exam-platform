@@ -1,54 +1,53 @@
-# ExamFlow PDF import on FastAPI Cloud
+# ExamFlow PDF import deployment notes
 
-## What was fixed
+## Native-text PDFs
 
-- Added `MAX_PDF_UPLOAD_MB` (default 15 MB). This is separate from `MAX_UPLOAD_BYTES=307200`, which is only for profile photos.
-- The previous preview endpoint referenced `settings.max_upload_mb`, a setting that did not exist and caused an internal-server-error response before parsing started.
-- Text-based Bengali PDFs now use their embedded text layer when it contains recognizable question blocks. OCR is no longer forced on every Bengali PDF.
-- OCR work runs in a worker thread so a multi-page PDF does not block FastAPI's async event loop.
-- The parser uses local Tesseract when the executable and both `ben` and `eng` language packs are available.
-- FastAPI Cloud's standard Python dependency build does not install OS packages such as the Tesseract executable. For scanned PDFs on FastAPI Cloud, an optional OCR.Space fallback is supported.
+The preview endpoint now checks the PDF's embedded text layer first. Digitally generated Bengali/English PDFs with recognizable question blocks are parsed locally; they do not require Tesseract or OCR.Space. The parser filters repeated headers/footers, detects text columns when possible, and supports Bengali option labels in parenthesized, one-per-line, and inline forms.
 
-## FastAPI Cloud environment variables
+## Scanned or damaged-text PDFs
 
-Set these in the ExamFlow app's Environment Variables page:
+Image-only PDFs and PDFs with unusable embedded text require OCR. FastAPI Cloud's standard source build may not include the Tesseract executable or Bengali language data. For these files, configure the following environment variables in FastAPI Cloud:
 
 ```env
 MAX_PDF_UPLOAD_MB=15
-MAX_PDF_PAGES=30
-PDF_OCR_DPI=240
-```
-
-For digitally generated PDFs with usable text layers, no third-party OCR key is required.
-
-For scanned PDFs or legacy Bengali-font PDFs whose embedded text cannot be parsed, optionally create an OCR.Space API key and add it as an encrypted secret:
-
-```env
-OCR_SPACE_API_KEY=your_ocr_space_api_key
+OCR_SPACE_API_KEY=YOUR_OCR_SPACE_API_KEY
 OCR_SPACE_ENGINE=3
 OCR_SPACE_TIMEOUT_SECONDS=90
 ```
 
-OCR.Space Engine 3 supports Bengali through automatic language detection. When the key is configured, only PDFs that need OCR are sent to OCR.Space. If you do not want question papers sent to a third-party OCR provider, leave the key empty and run the backend in a Docker/container environment with `tesseract-ocr`, `tesseract-ocr-ben`, and `tesseract-ocr-eng` installed. See the OCR.Space API documentation before enabling it: https://ocr.space/ocrapi
+Set the key as an encrypted secret, then redeploy. If Tesseract with both `ben` and `eng` is installed, it is preferred. Otherwise, OCR.Space is used only when the embedded text is not structurally usable.
 
-## Redeploy backend
-
-From the `backend` directory on Windows:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python -c "from app.main import app; print(app.title)"
-fastapi deploy
-```
-
-After deployment, test:
-
-- `GET https://YOUR-API.fastapicloud.dev/api/v1/health`
-- `POST https://YOUR-API.fastapicloud.dev/api/v1/imports/pdf/preview` (authenticated multipart form field `file`)
+OCR.Space receives rasterized page images. Do not enable remote OCR for confidential question papers unless your document policy allows the provider to process page images.
 
 ## Frontend API proxy
 
-Set `API_INTERNAL_URL` to the FastAPI Cloud origin only, e.g. `https://examflow-api.fastapicloud.dev` (no trailing slash and no `/api/v1`). `NEXT_PUBLIC_API_URL` should remain `/api/v1` so browser requests go through the Next.js same-origin rewrite and retain the HttpOnly auth cookie flow.
+Keep this browser setting:
 
-After changing `API_INTERNAL_URL`, restart `next dev` locally or redeploy the frontend so Next.js rebuilds its rewrite configuration.
+```env
+NEXT_PUBLIC_API_URL=/api/v1
+```
+
+Set the server-side backend origin only (no path suffix):
+
+```env
+API_INTERNAL_URL=https://examflow-api.fastapicloud.dev
+```
+
+The Next.js rewrite removes trailing slashes automatically. Restart `npm run dev` after changing environment variables, or redeploy the frontend.
+
+## Verification after deployment
+
+1. Open `https://examflow-api.fastapicloud.dev/api/v1/health` and confirm the service reports `ok`.
+2. Sign in to ExamFlow and upload the searchable Biology test PDF.
+3. Confirm the preview reports `Embedded text extracted`, 50 questions, and four options per question.
+4. Upload a scanned PDF only after confirming that a Bengali OCR engine is configured.
+
+## Preview endpoint status codes
+
+- `400`: unreadable or password-protected PDF.
+- `413`: PDF exceeds the configured upload-size limit.
+- `415`: file is not a PDF.
+- `422`: FastAPI request validation failed before extraction.
+- `502`: OCR provider request failed or rejected the document.
+- `503`: no Bengali-capable OCR engine is configured for a scanned/damaged-text PDF.
+- `500`: unexpected internal extraction failure; inspect backend logs for the traceback.

@@ -33,6 +33,9 @@ OPTION_MARKER_RE = re.compile(
     r"(?<!\S)[(（\[]\s*(?P<label>[^\s()（）\[\]]{1,2})\s*[)）\]]\s*"
 )
 OPTION_BARE_MARKER_RE = re.compile(r"^\s*(?:[€£@])?\s*(?P<label>[কখগঘ](?:ে)?|[A-Da-d1-4])\s*[)৷।.]\s*", re.IGNORECASE)
+# Digital Bengali PDFs often use ক. খ. গ. ঘ. rather than parenthesized labels.
+# This also handles OCR output where two or more options share one text line.
+OPTION_INLINE_BARE_RE = re.compile(r"(?<!\S)(?P<label>[কখগঘ](?:ে)?|[A-Da-d1-4])\s*[).৷।]\s*", re.IGNORECASE)
 
 
 class OCRUnavailableError(RuntimeError):
@@ -79,7 +82,13 @@ def _metadata(text: str) -> dict[str, Any]:
     if exam_title:
         exam_title = exam_title.replace("বিশৃবিদ্যালয়", "বিশ্ববিদ্যালয়").replace("বিশৃবিদ্যালয়", "বিশ্ববিদ্যালয়")
 
-    count_match = re.search(r"(?:মোট\s*প্রশ্ন|total\s+questions|no\.?\s+of\s+questions)\s*[:：]?\s*([০-৯0-9]+)", text, re.IGNORECASE)
+    count_match = re.search(
+        r"(?:মোট\s*প্রশ্ন|total\s+questions|no\.?\s+of\s+questions)\s*[:：]?\s*(?P<count>[০-৯0-9]+)"
+        r"|(?P<count2>[০-৯0-9]+)\s*টি\s*(?:বহুনির্বাচনি\s*)?প্রশ্ন",
+        text,
+        re.IGNORECASE,
+    )
+    count_token = (count_match.group("count") or count_match.group("count2")) if count_match else None
     duration_match = re.search(r"(?:সময়|সময়|time)\s*[:：]?\s*([০-৯0-9]+)\s*(?:মিনিট|minutes?|mins?)", text, re.IGNORECASE)
     marks_match = re.search(r"(?:পূর্ণমান|মোট\s*নম্বর|মোট\s*মার্ক|full\s+marks|total\s+marks|maximum\s+marks)\s*[:：]?\s*([০-৯0-9]+)", text, re.IGNORECASE)
 
@@ -88,7 +97,7 @@ def _metadata(text: str) -> dict[str, Any]:
         "chapter": chapter or None,
         "exam_title": exam_title or None,
         "set_name": set_name,
-        "declared_question_count": int(_ascii_digits(count_match.group(1))) if count_match else None,
+        "declared_question_count": int(_ascii_digits(count_token)) if count_token else None,
         "duration_minutes": int(_ascii_digits(duration_match.group(1))) if duration_match else None,
         "total_marks": float(_ascii_digits(marks_match.group(1))) if marks_match else None,
     }
@@ -107,26 +116,43 @@ def _question_marker(line: str) -> tuple[int, str | None] | None:
 
 
 def _option_segments(line: str) -> list[str]:
-    """Split one OCR line into option texts, supporting Bengali option labels."""
+    """Split option text whether labels are parenthesized or written inline as ক. / খ)."""
+    line = _clean(line)
+    if not line:
+        return []
+
     matches = list(OPTION_MARKER_RE.finditer(line))
-    if not matches:
-        bare = OPTION_BARE_MARKER_RE.match(line)
-        if bare:
-            value = _clean(line[bare.end():]).strip(" ,;|")
-            return [value] if value else [""]
-        return []
+    if matches:
+        # Multiple parenthesized labels indicate an inline options row.
+        if len(matches) == 1 and line[:matches[0].start()].strip():
+            return []
+        values: list[str] = []
+        for index, marker in enumerate(matches):
+            start = marker.end()
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(line)
+            value = _clean(line[start:end]).strip(" ,;|")
+            values.append(value)
+        return values
 
-    # A single parenthesized marker is an option only when it starts the line.
-    if len(matches) == 1 and matches[0].start() > 1:
-        return []
+    bare_matches = list(OPTION_INLINE_BARE_RE.finditer(line))
+    if bare_matches:
+        # Do not treat a label embedded in a sentence as an option. A single
+        # bare marker is valid only at the start; multiple markers are valid
+        # when the line begins with the first marker.
+        if line[:bare_matches[0].start()].strip():
+            return []
+        values = []
+        for index, marker in enumerate(bare_matches):
+            start = marker.end()
+            end = bare_matches[index + 1].start() if index + 1 < len(bare_matches) else len(line)
+            values.append(_clean(line[start:end]).strip(" ,;|"))
+        return values
 
-    values: list[str] = []
-    for index, marker in enumerate(matches):
-        start = marker.end()
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(line)
-        value = _clean(line[start:end]).strip(" ,;|")
-        values.append(value)
-    return values
+    bare = OPTION_BARE_MARKER_RE.match(line)
+    if bare:
+        value = _clean(line[bare.end():]).strip(" ,;|")
+        return [value] if value else [""]
+    return []
 
 
 def _is_question_like_continuation(line: str) -> bool:
@@ -328,6 +354,119 @@ def _column_rectangles(page: fitz.Page) -> list[fitz.Rect]:
     ]
 
 
+
+def _native_page_texts(document: fitz.Document) -> tuple[list[str], str]:
+    """Extract the embedded text layer in visual reading order, excluding page furniture.
+
+    The first page's header is returned separately for metadata. Pages with a
+    genuine two-column text layout are split using text-block x positions, even
+    when the PDF has no visible divider line.
+    """
+    page_texts: list[str] = []
+    metadata_text = ""
+
+    for page_index, page in enumerate(document):
+        page_height = page.rect.height
+        page_width = page.rect.width
+        blocks = [
+            block for block in page.get_text("blocks")
+            if len(block) > 6 and block[6] == 0
+            and block[1] > 35 and block[3] < page_height - 38
+        ]
+
+        question_blocks = []
+        for block in blocks:
+            nonempty = [_clean(line) for line in block[4].splitlines() if _clean(line)]
+            if nonempty and _question_marker(nonempty[0]):
+                question_blocks.append(block)
+
+        if question_blocks:
+            first_question_y = min(block[1] for block in question_blocks)
+            content_top = max(35, first_question_y - 3)
+            content_bottom = page_height - 38
+        else:
+            # Keep a conservative fallback for PDFs whose question number is
+            # separated from the stem in a way that cannot be located by blocks.
+            first_question_y = None
+            content_top = 40
+            content_bottom = page_height - 38
+
+        if page_index == 0 and first_question_y is not None:
+            header_rect = fitz.Rect(18, 40, page_width - 18, max(41, first_question_y - 4))
+            metadata_text = page.get_text("text", clip=header_rect, sort=True)
+
+        content_blocks = [
+            block for block in blocks
+            if block[1] >= content_top and block[3] <= content_bottom
+        ]
+
+        # Start with an explicit vector divider when the PDF contains one.
+        columns = _column_rectangles(page)
+        if len(columns) == 1 and len(content_blocks) >= 8:
+            # Detect an unruled two-column layout from a clear gap between the
+            # left and right text-block origins. Single-column indents are only
+            # a few points apart and will not pass this threshold.
+            x_values = sorted(block[0] for block in content_blocks)
+            gaps = [(x_values[i + 1] - x_values[i], x_values[i], x_values[i + 1])
+                    for i in range(len(x_values) - 1)]
+            if gaps:
+                gap, left_edge, right_edge = max(gaps, key=lambda item: item[0])
+                left_count = sum(1 for block in content_blocks if block[0] <= left_edge)
+                right_count = sum(1 for block in content_blocks if block[0] >= right_edge)
+                if gap >= page_width * 0.12 and left_count >= 3 and right_count >= 3:
+                    divider_x = (left_edge + right_edge) / 2
+                    columns = [
+                        fitz.Rect(18, content_top, divider_x - 5, content_bottom),
+                        fitz.Rect(divider_x + 5, content_top, page_width - 18, content_bottom),
+                    ]
+
+        if len(columns) == 1:
+            columns = [fitz.Rect(18, content_top, page_width - 18, content_bottom)]
+        else:
+            columns = [
+                fitz.Rect(rect.x0, content_top, rect.x1, content_bottom)
+                for rect in columns
+            ]
+
+        for rect in columns:
+            text = page.get_text("text", clip=rect, sort=True)
+            # Remove a footer if it falls inside a page with an unusual crop.
+            kept_lines = [
+                line for line in text.splitlines()
+                if not re.search(r"(?:পৃষ্ঠা|page)\s*[০-৯0-9]+\s*$", _clean(line), re.IGNORECASE)
+            ]
+            cleaned = "\n".join(kept_lines).strip()
+            if cleaned:
+                page_texts.append(cleaned)
+
+    return page_texts, metadata_text
+
+
+def _native_text_is_usable(text: str) -> bool:
+    """Return true when an embedded text sample contains parseable question blocks."""
+    candidates = _parse_column_candidates(text or "")
+    return any(
+        len(candidate.get("prompt", "")) >= 8
+        and (len(candidate.get("options", [])) >= 2 or len(candidate.get("prompt", "")) >= 30)
+        for candidate in candidates
+    )
+
+
+def _native_questions_are_usable(questions: list[dict[str, Any]], declared_count: int | None) -> bool:
+    """Reject damaged embedded text layers, but accept clean MCQ and short-answer PDFs."""
+    if not questions:
+        return False
+    valid = [question for question in questions if len(question.get("prompt", "").strip()) >= 8]
+    if not valid:
+        return False
+    if declared_count:
+        minimum = max(1, int(declared_count * 0.60))
+        if len(valid) < minimum:
+            return False
+    with_options = sum(1 for question in valid if len(question.get("options", [])) >= 2)
+    short_answers = sum(1 for question in valid if not question.get("options"))
+    return with_options >= max(1, int(len(valid) * 0.50)) or short_answers == len(valid)
+
 def _render(page: fitz.Page, rect: fitz.Rect, dpi: int) -> Image.Image:
     pix = page.get_pixmap(matrix=fitz.Matrix(dpi / 72, dpi / 72), clip=rect, alpha=False)
     return Image.open(BytesIO(pix.tobytes("png"))).convert("RGB")
@@ -344,7 +483,13 @@ def _tesseract_ready() -> bool:
 
 
 def _ocr_tesseract(image: Image.Image, psm: int) -> str:
-    return pytesseract.image_to_string(image, lang="ben+eng", config=f"--oem 1 --psm {psm}")
+    try:
+        return pytesseract.image_to_string(image, lang="ben+eng", config=f"--oem 1 --psm {psm}")
+    except (pytesseract.TesseractNotFoundError, pytesseract.TesseractError) as exc:
+        raise OCRUnavailableError(
+            "Local Tesseract OCR could not process this PDF. Install the Bengali and English language data, "
+            "or configure OCR_SPACE_API_KEY for scanned PDFs."
+        ) from exc
 
 
 def _prepend_missing_first_question(text: str, page: fitz.Page, rect: fitz.Rect, expected_start: int, dpi: int) -> str:
@@ -446,7 +591,7 @@ def _make_page_composite(page: fitz.Page, page_index: int, dpi: int) -> Image.Im
 
 def _ocr_space_image(client: httpx.Client, image: Image.Image, api_key: str, engine: int) -> str:
     buffer = BytesIO()
-    image.save(buffer, format="JPEG", quality=88, optimize=True)
+    image.save(buffer, format="JPEG", quality=84, optimize=True)
     files = {"file": ("exam-page.jpg", buffer.getvalue(), "image/jpeg")}
     data = {
         "language": "auto",
@@ -455,13 +600,29 @@ def _ocr_space_image(client: httpx.Client, image: Image.Image, api_key: str, eng
         "scale": "true",
         "filetype": "JPG",
     }
-    response = client.post("https://api.ocr.space/parse/image", headers={"apikey": api_key}, data=data, files=files)
-    response.raise_for_status()
-    payload = response.json()
+    try:
+        response = client.post(
+            "https://api.ocr.space/parse/image",
+            headers={"apikey": api_key},
+            data=data,
+            files=files,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        raise OCRServiceError(
+            f"OCR.Space rejected the page (HTTP {status}). Check the API key, account quota, and image-size limit."
+        ) from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        raise OCRServiceError(
+            f"Could not reach or read the OCR.Space response ({type(exc).__name__}). Check outbound network access and OCR configuration."
+        ) from exc
+
     if payload.get("IsErroredOnProcessing"):
         errors = payload.get("ErrorMessage") or payload.get("ErrorDetails") or "OCR provider could not process this page."
         if isinstance(errors, list):
-            errors = "; ".join(str(x) for x in errors)
+            errors = "; ".join(str(item) for item in errors)
         raise OCRServiceError(str(errors))
     parsed = payload.get("ParsedResults") or []
     text = "\n".join(item.get("ParsedText", "") for item in parsed)
@@ -477,6 +638,37 @@ def _ocr_remote_columns(document: fitz.Document, dpi: int, api_key: str, engine:
             composite = _make_page_composite(page, page_index, dpi)
             page_texts.append(_ocr_space_image(client, composite, api_key, engine))
     return page_texts, f"ocr.space-engine-{engine}"
+
+
+def _structural_confidence(prompt: str, options: list[str]) -> float:
+    """Estimate parse-structure completeness; this is not OCR character accuracy."""
+    score = 0.25
+    prompt_length = len(_clean(prompt))
+    if prompt_length >= 12:
+        score += 0.20
+    elif prompt_length >= 6:
+        score += 0.10
+
+    option_count = len(options)
+    if option_count == 4:
+        score += 0.25
+    elif option_count == 3:
+        score += 0.18
+    elif option_count == 2:
+        score += 0.12
+    elif option_count == 1:
+        score += 0.06
+
+    if options:
+        nonempty = sum(1 for option in options if _clean(option))
+        score += 0.10 * (nonempty / len(options))
+        normalized = [re.sub(r"\s+", " ", _clean(option)).casefold() for option in options]
+        if len(set(normalized)) == len(normalized):
+            score += 0.05
+
+    if _clean(prompt).endswith(("?", "？", "।")):
+        score += 0.05
+    return round(min(0.95, max(0.35, score)), 2)
 
 
 def _parse_question_pages(page_texts: list[str], declared_count: int | None) -> list[dict[str, Any]]:
@@ -499,7 +691,7 @@ def _parse_question_pages(page_texts: list[str], declared_count: int | None) -> 
                 warnings.append(f"Only {len(options)} options were detected; check whether an option was missed by OCR.")
             if len(prompt) < 12:
                 warnings.append("Question text is unusually short; check the original PDF.")
-            confidence = 0.82 if len(options) == 4 and len(prompt) >= 12 else (0.72 if len(options) == 3 else (0.62 if len(options) == 2 else 0.40))
+            confidence = _structural_confidence(prompt, options)
             questions.append({
                 "number": candidate["number"],
                 "kind": kind,
@@ -541,47 +733,59 @@ def parse_exam_pdf(
         document = fitz.open(stream=raw, filetype="pdf")
     except Exception as exc:
         raise ValueError("The uploaded file is not a readable PDF.") from exc
-    if document.is_encrypted:
-        document.close()
-        raise ValueError("Password-protected PDFs are not supported. Upload an unlocked PDF.")
-    page_count = len(document)
-    if page_count > max_pages:
-        document.close()
-        raise ValueError(f"This PDF has {page_count} pages; the current limit is {max_pages} pages.")
 
-    native_text = "\n".join(page.get_text("text") for page in document)
-    has_bengali = bool(BENGALI_RE.search(native_text))
-    # Bengali embedded fonts frequently expose a broken ToUnicode map even
-    # when the page looks perfect. OCR them rather than trusting garbled text.
-    use_ocr = has_bengali or len(native_text.strip()) < 100
-    ocr_used = False
-    ocr_engine = "embedded-text"
-    metadata_text = native_text
+    try:
+        if document.is_encrypted:
+            raise ValueError("Password-protected PDFs are not supported. Upload an unlocked PDF.")
+        page_count = len(document)
+        if page_count > max_pages:
+            raise ValueError(f"This PDF has {page_count} pages; the current limit is {max_pages} pages.")
 
-    if use_ocr:
-        ocr_used = True
-        if _tesseract_ready():
-            # Read the page-one heading separately for reliable subject/chapter/set metadata.
-            header_rect = fitz.Rect(18, 12, document[0].rect.width - 18, min(130, document[0].rect.height))
-            header_text = _ocr_tesseract(_render(document[0], header_rect, max(dpi, 280)), 11)
-            metadata_text = header_text
-            page_texts, ocr_engine = _ocr_local_columns(document, dpi, None)
-        elif ocr_space_api_key:
-            page_texts, ocr_engine = _ocr_remote_columns(document, dpi, ocr_space_api_key, ocr_space_engine, ocr_space_timeout_seconds)
-            metadata_text = page_texts[0] if page_texts else native_text
+        native_page_texts, native_header = _native_page_texts(document)
+        native_metadata = _metadata(native_header)
+        native_questions = _parse_question_pages(native_page_texts, native_metadata["declared_question_count"])
+
+        if _native_questions_are_usable(native_questions, native_metadata["declared_question_count"]):
+            page_texts = native_page_texts
+            metadata_text = native_header
+            metadata = native_metadata
+            questions = native_questions
+            ocr_used = False
+            ocr_engine = "embedded-text"
         else:
-            document.close()
-            raise OCRUnavailableError(
-                "Bengali OCR is not configured on this cloud deployment. Add OCR_SPACE_API_KEY in FastAPI Cloud environment variables, then redeploy."
-            )
-    else:
-        # For clean native-text PDFs, retain page text. PyMuPDF preserves
-        # column reading order for standard single-column documents.
-        page_texts = [page.get_text("text") for page in document]
+            ocr_used = True
+            metadata_text = native_header
+            if _tesseract_ready():
+                # OCR the heading only when the embedded header is too sparse.
+                if not metadata_text.strip():
+                    header_rect = fitz.Rect(18, 12, document[0].rect.width - 18, min(150, document[0].rect.height))
+                    metadata_text = _ocr_tesseract(_render(document[0], header_rect, max(dpi, 280)), 11)
+                page_texts, ocr_engine = _ocr_local_columns(
+                    document, dpi, native_metadata["declared_question_count"]
+                )
+            elif ocr_space_api_key:
+                page_texts, ocr_engine = _ocr_remote_columns(
+                    document, dpi, ocr_space_api_key, ocr_space_engine, ocr_space_timeout_seconds
+                )
+                if not metadata_text.strip():
+                    metadata_text = page_texts[0] if page_texts else ""
+            else:
+                raise OCRUnavailableError(
+                    "This PDF does not contain a usable question text layer, and Bengali OCR is not configured. "
+                    "Install Tesseract with ben+eng language data or configure OCR_SPACE_API_KEY, then redeploy."
+                )
+            metadata = _metadata(metadata_text)
+            questions = _parse_question_pages(page_texts, metadata["declared_question_count"])
 
-    document.close()
-    metadata = _metadata(metadata_text)
-    questions = _parse_question_pages(page_texts, metadata["declared_question_count"])
+        if ocr_used:
+            for question in questions:
+                question["confidence"] = round(max(0.35, question["confidence"] - 0.08), 2)
+        if metadata["declared_question_count"] and metadata["declared_question_count"] != len(questions):
+            for question in questions:
+                question["confidence"] = round(max(0.35, question["confidence"] - 0.08), 2)
+    finally:
+        document.close()
+
     warnings: list[str] = []
     if ocr_used:
         warnings.append("OCR was used. Review Bengali wording, chemical formulas, subscripts, and symbols against the original PDF before publishing.")
@@ -608,5 +812,6 @@ def parse_exam_pdf(
         "questions": questions,
         "question_count_detected": len(questions),
         "warnings": list(dict.fromkeys(warnings)),
-        "extraction_note": "Extracted content is a draft. Review all question text and options before creating an exam. Correct answers are not inferred when the PDF does not provide an answer key.",
+        "extraction_note": "Extracted content is a draft. Review all question text and options against the original PDF before creating an exam. The structure score reflects question/option completeness, not a verified probability of character-level OCR accuracy. Correct answers are never inferred.",
     }
+

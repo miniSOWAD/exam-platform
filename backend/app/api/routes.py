@@ -479,10 +479,14 @@ async def preview_exam_pdf(file:UploadFile=File(...),db:Session=Depends(get_db),
     except OCRServiceError as exc:
         raise HTTPException(502,f"Bengali OCR service failed: {exc}")
     except Exception as exc:
-        # Log the detailed exception server-side; return a useful safe message.
+        # 422 is reserved for malformed client input. Unexpected parser failures
+        # are server errors and must be visible as such in monitoring/logs.
         import logging
         logging.getLogger(__name__).exception("PDF preview extraction failed")
-        raise HTTPException(422,"Could not extract structured questions from this PDF. Check the PDF and OCR configuration, then try again.")
+        raise HTTPException(
+            500,
+            "PDF extraction failed unexpectedly. Check the backend logs for the request details, then retry.",
+        ) from exc
 
 
 @router.post("/imports/pdf/create-exam",status_code=201)
