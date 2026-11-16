@@ -56,7 +56,10 @@ class Exam(Base):
     ended_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True), nullable=True)
     scheduled_start_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True), nullable=True, index=True)
     scheduled_end_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True), nullable=True)
+    scheduled_resume_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True), nullable=True)
     time_extension_seconds: Mapped[int]=mapped_column(Integer, default=0)
+    answers_public: Mapped[bool]=mapped_column(Boolean, default=False, nullable=False)
+    hide_participant_answers: Mapped[bool]=mapped_column(Boolean, default=False, nullable=False)
     created_by: Mapped[str]=mapped_column(ForeignKey("users.id"))
     created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=now)
     questions: Mapped[list["Question"]]=relationship(back_populates="exam", cascade="all, delete-orphan")
@@ -82,6 +85,17 @@ class AccessGrant(Base):
     active: Mapped[bool]=mapped_column(Boolean, default=True)
     __table_args__=(UniqueConstraint("exam_id","student_id"),)
 
+class AnswerVisibilityGrant(Base):
+    """Explicit permission for a student to view an exam answer sheet after it ends."""
+    __tablename__="answer_visibility_grants"
+    id: Mapped[str]=mapped_column(String(36), primary_key=True, default=uid)
+    exam_id: Mapped[str]=mapped_column(ForeignKey("exams.id", ondelete="CASCADE"), index=True)
+    student_id: Mapped[str]=mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    granted_by: Mapped[str]=mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=now)
+    __table_args__=(UniqueConstraint("exam_id", "student_id", name="uq_answer_visibility_exam_student"),)
+
+
 class Attempt(Base):
     __tablename__="attempts"
     id: Mapped[str]=mapped_column(String(36), primary_key=True, default=uid)
@@ -89,6 +103,10 @@ class Attempt(Base):
     student_id: Mapped[str]=mapped_column(ForeignKey("users.id"), index=True)
     attempt_number: Mapped[int]=mapped_column(Integer, default=1)
     status: Mapped[str]=mapped_column(String(30), default="in_progress", index=True)
+    is_admin_attempt: Mapped[bool]=mapped_column(Boolean, default=False, nullable=False)
+    is_staff_attempt: Mapped[bool]=mapped_column(Boolean, default=False, nullable=False)
+    visited_question_ids: Mapped[list]=mapped_column(JSON, default=list, nullable=False)
+    pause_seconds_at_start: Mapped[int]=mapped_column(Integer, default=0, nullable=False)
     started_at: Mapped[datetime]=mapped_column(DateTime(timezone=True), default=now)
     submitted_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True), nullable=True)
     score: Mapped[float|None]=mapped_column(Float, nullable=True)
