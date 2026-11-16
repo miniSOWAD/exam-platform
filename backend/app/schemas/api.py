@@ -121,6 +121,21 @@ class DurationUpdate(BaseModel):
     duration_minutes: int = Field(ge=1, le=1440)
 
 
+class AnswerVisibilityUpdate(BaseModel):
+    answers_public: bool | None = None
+    hide_participant_answers: bool | None = None
+
+    @model_validator(mode="after")
+    def require_visibility_setting(self):
+        if self.answers_public is None and self.hide_participant_answers is None:
+            raise ValueError("Provide answers_public or hide_participant_answers")
+        return self
+
+
+class AnswerVisibilityGrantIn(BaseModel):
+    student_email: EmailStr
+
+
 class CreateManagedUserIn(BaseModel):
     email: EmailStr
     full_name: str = Field(min_length=2, max_length=160)
