@@ -7,8 +7,8 @@ import jwt, fitz, re
 from app.core.database import get_db
 from app.core.security import hash_password, verify_password, create_token, decode_token
 from app.core.config import settings
-from app.models.entities import User, Role, Exam, ExamStatus, Question, Attempt, AccessGrant, PermissionGrant, HistoricalResult, SiteContent, LeaderboardEntry, LeaderboardExclusion
-from app.schemas.api import RegisterIn, LoginIn, UserOut, ExamIn, QuestionIn, AnswerIn, GrantIn, PermissionIn, PDFCreateExamIn, SiteContentUpdate, ScheduleUpdate, ExtendTimeIn, AnswerKeyApplyIn, DurationUpdate, CreateManagedUserIn, UserStatusUpdate, UserRoleUpdate, LeaderboardEntryCreate, LeaderboardRemoveIn
+from app.models.entities import User, Role, Exam, ExamStatus, Question, Attempt, AccessGrant, AnswerVisibilityGrant, PermissionGrant, HistoricalResult, SiteContent, LeaderboardEntry, LeaderboardExclusion
+from app.schemas.api import RegisterIn, LoginIn, UserOut, ExamIn, QuestionIn, AnswerIn, GrantIn, PermissionIn, PDFCreateExamIn, SiteContentUpdate, ScheduleUpdate, ExtendTimeIn, AnswerKeyApplyIn, DurationUpdate, CreateManagedUserIn, UserStatusUpdate, UserRoleUpdate, LeaderboardEntryCreate, LeaderboardRemoveIn, AnswerVisibilityUpdate, AnswerVisibilityGrantIn
 from app.services.pdf_exam_parser import parse_exam_pdf, OCRUnavailableError, OCRServiceError
 from app.services.answer_key_parser import extract_answer_key_file
 from app.services.cloudinary_images import InvalidProfileImage, validate_image_bytes, upload_image, delete_image
@@ -54,8 +54,53 @@ def _remaining_seconds(exam, attempt, now=None):
         effective_now=_as_utc(exam.paused_at)
     else:
         effective_now=now
-    elapsed=max(0,int((effective_now-started).total_seconds())-int(exam.accumulated_pause_seconds or 0))
+    pauses_since_attempt=max(0,int(exam.accumulated_pause_seconds or 0)-int(getattr(attempt,"pause_seconds_at_start",0) or 0))
+    elapsed=max(0,int((effective_now-started).total_seconds())-pauses_since_attempt)
     return max(0,int(exam.duration_seconds)-elapsed)
+
+
+def _maybe_apply_scheduled_transition(exam: Exam | None, db: Session, now=None) -> bool:
+    """Apply due scheduled starts/resumes when an exam is read or joined.
+
+    This is request-driven rather than a background scheduler: every public exam
+    listing, exam detail and active-attempt poll checks due transitions. The
+    transaction is short and idempotent, so multiple students can safely poll.
+    """
+    if exam is None:
+        return False
+    now = _as_utc(now or datetime.now(timezone.utc))
+    changed = False
+    if exam.status in [ExamStatus.live, ExamStatus.paused] and exam.scheduled_end_at and _as_utc(exam.scheduled_end_at) <= now:
+        exam.status = ExamStatus.ended
+        exam.ended_at = now
+        exam.paused_at = None
+        exam.scheduled_resume_at = None
+        _finalize_student_attempts(exam, db, now=now)
+        changed = True
+    elif exam.status == ExamStatus.published and exam.scheduled_start_at and _as_utc(exam.scheduled_start_at) <= now:
+        exam.status = ExamStatus.live
+        exam.started_at = now
+        exam.paused_at = None
+        exam.scheduled_resume_at = None
+        # Admin preview attempts created before the scheduled start begin their
+        # timer when the examination actually becomes live.
+        db.query(Attempt).filter_by(exam_id=exam.id, is_admin_attempt=True, status="in_progress").update(
+            {Attempt.started_at: now, Attempt.pause_seconds_at_start: int(exam.accumulated_pause_seconds or 0)}, synchronize_session=False
+        )
+        changed = True
+    elif exam.status == ExamStatus.paused and exam.scheduled_resume_at and _as_utc(exam.scheduled_resume_at) <= now:
+        if exam.paused_at:
+            exam.accumulated_pause_seconds = int(exam.accumulated_pause_seconds or 0) + max(
+                0, int((now - _as_utc(exam.paused_at)).total_seconds())
+            )
+        exam.paused_at = None
+        exam.scheduled_resume_at = None
+        exam.status = ExamStatus.live
+        changed = True
+    if changed:
+        db.commit()
+        db.refresh(exam)
+    return changed
 
 def _site_content_out(row=None):
     if row is None: return dict(DEFAULT_SITE_CONTENT)
@@ -75,11 +120,18 @@ def current_user(request: Request, db: Session=Depends(get_db)):
     if not user or not user.active: raise HTTPException(401,"Account unavailable")
     return user
 
+def _has_permission(user: User, db: Session, code: str) -> bool:
+    if user.role == Role.admin:
+        return True
+    if user.role != Role.moderator:
+        return False
+    return db.query(PermissionGrant).filter_by(moderator_id=user.id, code=code, active=True).first() is not None
+
+
 def require(user: User, db: Session, code: str):
-    if user.role==Role.admin: return
-    if user.role!=Role.moderator: raise HTTPException(403,"Permission denied")
-    grant=db.query(PermissionGrant).filter_by(moderator_id=user.id,code=code,active=True).first()
-    if not grant: raise HTTPException(403,"Permission denied")
+    if _has_permission(user, db, code):
+        return
+    raise HTTPException(403, "Permission denied")
 
 def safe_question(q: Question):
     # Imported PDFs store option keys (A/B/C/D); the student UI consumes option IDs.
@@ -334,10 +386,12 @@ def remove_managed_user(user_id: str, db: Session = Depends(get_db), user: User 
     db.query(PermissionGrant).filter_by(granted_by=target.id).update({PermissionGrant.granted_by: user.id}, synchronize_session=False)
     db.query(LeaderboardEntry).filter_by(created_by=target.id).update({LeaderboardEntry.created_by: user.id}, synchronize_session=False)
     db.query(LeaderboardExclusion).filter_by(created_by=target.id).update({LeaderboardExclusion.created_by: user.id}, synchronize_session=False)
+    db.query(AnswerVisibilityGrant).filter_by(granted_by=target.id).update({AnswerVisibilityGrant.granted_by: user.id}, synchronize_session=False)
 
     # Remove user-linked records and attempts so deleted users no longer appear in rankings.
     db.query(PermissionGrant).filter_by(moderator_id=target.id).delete(synchronize_session=False)
     db.query(AccessGrant).filter_by(student_id=target.id).delete(synchronize_session=False)
+    db.query(AnswerVisibilityGrant).filter_by(student_id=target.id).delete(synchronize_session=False)
     db.query(Attempt).filter_by(student_id=target.id).delete(synchronize_session=False)
     db.query(LeaderboardEntry).filter_by(student_id=target.id).delete(synchronize_session=False)
     db.query(LeaderboardExclusion).filter_by(student_id=target.id).delete(synchronize_session=False)
@@ -356,27 +410,49 @@ def create_exam(data:ExamIn,db:Session=Depends(get_db),user:User=Depends(current
     exam=Exam(**values,created_by=user.id); db.add(exam); db.commit(); db.refresh(exam); return exam_out(exam)
 
 def exam_out(e):
-    return {"id":e.id,"title":e.title,"description":e.description,"subject":e.subject,"status":e.status.value,"access_mode":e.access_mode,"duration_seconds":e.duration_seconds,"max_attempts":e.max_attempts,"pass_marks":e.pass_marks,"chapter":e.chapter,"set_name":e.set_name,"paper":e.paper,"declared_question_count":e.declared_question_count,"source_file_name":e.source_file_name,"scheduled_start_at":_as_utc(e.scheduled_start_at).isoformat() if e.scheduled_start_at else None,"scheduled_end_at":_as_utc(e.scheduled_end_at).isoformat() if e.scheduled_end_at else None,"time_extension_seconds":e.time_extension_seconds or 0,"question_count":len(e.questions)}
+    return {"id":e.id,"title":e.title,"description":e.description,"subject":e.subject,"status":e.status.value,"access_mode":e.access_mode,"duration_seconds":e.duration_seconds,"max_attempts":e.max_attempts,"pass_marks":e.pass_marks,"chapter":e.chapter,"set_name":e.set_name,"paper":e.paper,"declared_question_count":e.declared_question_count,"source_file_name":e.source_file_name,"scheduled_start_at":_as_utc(e.scheduled_start_at).isoformat() if e.scheduled_start_at else None,"scheduled_end_at":_as_utc(e.scheduled_end_at).isoformat() if e.scheduled_end_at else None,"scheduled_resume_at":_as_utc(e.scheduled_resume_at).isoformat() if e.scheduled_resume_at else None,"time_extension_seconds":e.time_extension_seconds or 0,"answers_public":bool(e.answers_public),"hide_participant_answers":bool(e.hide_participant_answers),"question_count":len(e.questions)}
 
 @router.get("/public/exams")
 def public_exams(db:Session=Depends(get_db)):
     exams=db.query(Exam).filter(Exam.access_mode=="all_students",Exam.status.in_([ExamStatus.published,ExamStatus.live,ExamStatus.paused])).order_by(Exam.scheduled_start_at.asc().nullslast(),Exam.created_at.desc()).limit(30).all()
+    for exam in exams: _maybe_apply_scheduled_transition(exam,db)
     return [exam_out(e) for e in exams]
 
 @router.get("/exams")
 def list_exams(db:Session=Depends(get_db),user:User=Depends(current_user)):
     exams=db.query(Exam).filter(Exam.status!=ExamStatus.archived).order_by(Exam.created_at.desc()).limit(100).all()
+    for exam in exams: _maybe_apply_scheduled_transition(exam,db)
     if user.role==Role.student:
         visible_statuses={ExamStatus.published,ExamStatus.live,ExamStatus.paused,ExamStatus.ended,ExamStatus.results_published}
-        exams=[e for e in exams if e.status in visible_statuses and (e.access_mode=="all_students" or db.query(AccessGrant).filter_by(exam_id=e.id,student_id=user.id,active=True).first())]
+        visible = []
+        for exam in exams:
+            if exam.status not in visible_statuses:
+                continue
+            has_exam_access = exam.access_mode == "all_students" or db.query(AccessGrant).filter_by(exam_id=exam.id, student_id=user.id, active=True).first() is not None
+            has_attempt = db.query(Attempt).filter_by(exam_id=exam.id, student_id=user.id, is_admin_attempt=False).first() is not None
+            has_answer_permission = _student_can_view_unattempted_answer_sheet(db, exam, user)
+            if has_exam_access or has_attempt or has_answer_permission:
+                visible.append(exam)
+        exams = visible
     return [exam_out(e) for e in exams]
 
 @router.get("/exams/{exam_id}")
 def get_exam(exam_id:str,db:Session=Depends(get_db),user:User=Depends(current_user)):
     e=db.get(Exam,exam_id)
+    _maybe_apply_scheduled_transition(e,db)
     if not e or (user.role==Role.student and e.status==ExamStatus.draft): raise HTTPException(404,"Exam not found")
-    if user.role==Role.student and e.access_mode=="selected_students" and not db.query(AccessGrant).filter_by(exam_id=e.id,student_id=user.id,active=True).first(): raise HTTPException(403,"Exam access not granted")
-    return exam_out(e)
+    if _exam_has_ended(e):
+        _finalize_student_attempts(e, db)
+    if user.role==Role.student and e.access_mode=="selected_students":
+        has_exam_access = db.query(AccessGrant).filter_by(exam_id=e.id,student_id=user.id,active=True).first() is not None
+        has_attempt = db.query(Attempt).filter_by(exam_id=e.id,student_id=user.id,is_admin_attempt=False).first() is not None
+        has_answer_permission = _student_can_view_unattempted_answer_sheet(db, e, user)
+        if not (has_exam_access or has_attempt or has_answer_permission):
+            raise HTTPException(403,"Exam access not granted")
+    result = exam_out(e)
+    result["can_manage_answer_visibility"] = bool(user.role == Role.admin or (user.role == Role.moderator and _has_permission(user, db, "results.read")))
+    result["can_view_answer_sheet"] = bool(user.role in [Role.admin, Role.moderator] or _student_can_view_unattempted_answer_sheet(db, e, user))
+    return result
 
 @router.post("/exams/{exam_id}/questions")
 def add_question(exam_id:str,data:QuestionIn,db:Session=Depends(get_db),user:User=Depends(current_user)):
@@ -589,30 +665,100 @@ def publish_exam(exam_id:str,db:Session=Depends(get_db),user:User=Depends(curren
 
 @router.post("/exams/{exam_id}/control/{action}")
 def control_exam(exam_id:str,action:str,db:Session=Depends(get_db),user:User=Depends(current_user)):
+    if action == "stop":
+        action = "end"
+    if action == "force-start":
+        if user.role != Role.admin:
+            raise HTTPException(403, "Only the site admin can force-start an examination")
+        exam=db.query(Exam).filter(Exam.id==exam_id).with_for_update().first()
+        if not exam: raise HTTPException(404,"Exam not found")
+        if exam.status not in [ExamStatus.draft, ExamStatus.published, ExamStatus.paused]:
+            raise HTTPException(409, f"Cannot start an examination in {exam.status.value} state")
+        now=datetime.now(timezone.utc)
+        was_paused = exam.status == ExamStatus.paused
+        if was_paused and exam.paused_at:
+            exam.accumulated_pause_seconds = int(exam.accumulated_pause_seconds or 0) + max(
+                0, int((now - _as_utc(exam.paused_at)).total_seconds())
+            )
+        exam.status=ExamStatus.live
+        exam.started_at=exam.started_at or now
+        exam.paused_at=None
+        exam.scheduled_resume_at=None
+        # If the admin was previewing a draft/upcoming exam, start that preview
+        # clock now rather than charging time spent in preview mode.
+        if not was_paused:
+            db.query(Attempt).filter_by(exam_id=exam.id, is_admin_attempt=True, status="in_progress").update(
+                {Attempt.started_at: now, Attempt.pause_seconds_at_start: int(exam.accumulated_pause_seconds or 0)}, synchronize_session=False
+            )
+        db.commit(); db.refresh(exam); return exam_out(exam)
+
     mapping={"start":("exam.start",ExamStatus.published),"pause":("exam.pause",ExamStatus.live),"resume":("exam.resume",ExamStatus.paused),"end":("exam.end",None)}
     if action not in mapping: raise HTTPException(404,"Unknown action")
     perm,expected=mapping[action]; require(user,db,perm); e=db.query(Exam).filter(Exam.id==exam_id).with_for_update().first()
     if not e: raise HTTPException(404,"Exam not found")
-    if expected and e.status!=expected: raise HTTPException(409,f"Cannot {action} exam in {e.status.value} state")
+    _maybe_apply_scheduled_transition(e,db)
+    admin_start_from_draft = user.role == Role.admin and action == "start" and e.status == ExamStatus.draft
+    if expected and e.status!=expected and not admin_start_from_draft: raise HTTPException(409,f"Cannot {action} exam in {e.status.value} state")
     now=datetime.now(timezone.utc)
     if action=="start" and e.scheduled_start_at and _as_utc(e.scheduled_start_at)>now:
-        raise HTTPException(409,f"This examination is scheduled to start at {_as_utc(e.scheduled_start_at).isoformat()}")
-    if action=="start": e.status=ExamStatus.live; e.started_at=now
-    elif action=="pause": e.status=ExamStatus.paused; e.paused_at=now
+        raise HTTPException(409,f"This examination is scheduled to start at {_as_utc(e.scheduled_start_at).isoformat()}. Use force-start to start it now.")
+    if action=="start":
+        e.status=ExamStatus.live; e.started_at=now; e.paused_at=None; e.scheduled_resume_at=None
+        db.query(Attempt).filter_by(exam_id=e.id, is_admin_attempt=True, status="in_progress").update(
+            {Attempt.started_at: now, Attempt.pause_seconds_at_start: int(e.accumulated_pause_seconds or 0)}, synchronize_session=False
+        )
+    elif action=="pause": e.status=ExamStatus.paused; e.paused_at=now; e.scheduled_resume_at=None
     elif action=="resume":
         if e.paused_at: e.accumulated_pause_seconds += int((now-e.paused_at).total_seconds())
-        e.paused_at=None; e.status=ExamStatus.live
-    else: e.status=ExamStatus.ended; e.ended_at=now; e.paused_at=None
-    db.commit(); return exam_out(e)
+        e.paused_at=None; e.scheduled_resume_at=None; e.status=ExamStatus.live
+    else:
+        e.status=ExamStatus.ended; e.ended_at=now; e.paused_at=None; e.scheduled_resume_at=None
+        _finalize_student_attempts(e, db, now=now)
+    db.commit(); db.refresh(e); return exam_out(e)
 
 @router.patch("/exams/{exam_id}/schedule")
 def update_exam_schedule(exam_id:str,data:ScheduleUpdate,db:Session=Depends(get_db),user:User=Depends(current_user)):
-    require(user,db,"exam.update")
     exam=db.query(Exam).filter(Exam.id==exam_id).with_for_update().first()
     if not exam: raise HTTPException(404,"Exam not found")
-    if exam.status not in [ExamStatus.draft,ExamStatus.published]:
-        raise HTTPException(409,"Only draft or upcoming examinations can be rescheduled. Use time extension for a running exam.")
+    _maybe_apply_scheduled_transition(exam,db)
     updates=data.model_dump(exclude_unset=True)
+    now=datetime.now(timezone.utc)
+    is_admin = user.role == Role.admin
+
+    if exam.status in [ExamStatus.live, ExamStatus.paused]:
+        if not is_admin:
+            require(user,db,"exam.update")
+            raise HTTPException(409,"Only the site admin can reschedule a live or paused examination")
+        start = _as_utc(updates.get("scheduled_start_at", exam.scheduled_start_at))
+        end = _as_utc(updates.get("scheduled_end_at", exam.scheduled_end_at))
+        if start and end and end<=start: raise HTTPException(422,"Scheduled end must be after scheduled start")
+        if "scheduled_start_at" in updates:
+            if start and start > now:
+                if exam.status == ExamStatus.live:
+                    exam.status=ExamStatus.paused
+                    exam.paused_at=now
+                elif exam.paused_at is None:
+                    exam.paused_at=now
+                exam.scheduled_start_at=start
+                exam.scheduled_resume_at=start
+            else:
+                if exam.status == ExamStatus.paused and exam.paused_at:
+                    exam.accumulated_pause_seconds = int(exam.accumulated_pause_seconds or 0) + max(
+                        0, int((now - _as_utc(exam.paused_at)).total_seconds())
+                    )
+                    exam.status=ExamStatus.live
+                    exam.paused_at=None
+                exam.scheduled_start_at=start
+                exam.scheduled_resume_at=None
+        if "scheduled_end_at" in updates:
+            exam.scheduled_end_at=end
+        db.commit(); db.refresh(exam)
+        return {**exam_out(exam), "rescheduled_live_exam": True,
+                "message": "The examination has been paused and will automatically resume at the scheduled time." if exam.scheduled_resume_at else "The examination schedule was updated; the examination is live."}
+
+    require(user,db,"exam.update")
+    if exam.status not in [ExamStatus.draft,ExamStatus.published]:
+        raise HTTPException(409,"Only draft, upcoming, live or paused examinations can be rescheduled")
     start=_as_utc(updates.get("scheduled_start_at",exam.scheduled_start_at))
     end=_as_utc(updates.get("scheduled_end_at",exam.scheduled_end_at))
     if start and end and end<=start: raise HTTPException(422,"Scheduled end must be after scheduled start")
@@ -677,45 +823,232 @@ def grant_access(exam_id:str,data:GrantIn,db:Session=Depends(get_db),user:User=D
     else: db.add(AccessGrant(exam_id=exam_id,student_id=data.student_id))
     db.commit(); return {"granted":True}
 
+@router.patch("/exams/{exam_id}/answer-visibility")
+def update_answer_visibility(
+    exam_id: str,
+    data: AnswerVisibilityUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    """Control when students may see an ended exam's answer sheet."""
+    require(user, db, "results.read")
+    exam = db.get(Exam, exam_id)
+    if not exam:
+        raise HTTPException(404, "Examination not found")
+    if exam.status not in [ExamStatus.ended, ExamStatus.results_published, ExamStatus.archived]:
+        raise HTTPException(409, "Answer visibility can only be changed after the examination has ended")
+    updates = data.model_dump(exclude_unset=True)
+    if updates.get("answers_public") is True:
+        exam.answers_public = True
+        exam.hide_participant_answers = False
+    elif updates.get("hide_participant_answers") is True:
+        exam.hide_participant_answers = True
+        exam.answers_public = False
+    else:
+        if "answers_public" in updates:
+            exam.answers_public = bool(updates["answers_public"])
+        if "hide_participant_answers" in updates:
+            exam.hide_participant_answers = bool(updates["hide_participant_answers"])
+    db.commit(); db.refresh(exam)
+    return {"answers_public": bool(exam.answers_public), "hide_participant_answers": bool(exam.hide_participant_answers),
+            "message": "Answer visibility settings updated."}
+
+
+@router.get("/exams/{exam_id}/answer-access")
+def list_answer_visibility_grants(exam_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    require(user, db, "results.read")
+    exam = db.get(Exam, exam_id)
+    if not exam:
+        raise HTTPException(404, "Examination not found")
+    grants = db.query(AnswerVisibilityGrant, User).join(User, User.id == AnswerVisibilityGrant.student_id).filter(
+        AnswerVisibilityGrant.exam_id == exam_id
+    ).order_by(User.full_name.asc()).all()
+    return [{"student_id": grant.student_id, "full_name": student.full_name, "email": student.email,
+             "granted_at": _as_utc(grant.created_at).isoformat() if grant.created_at else None}
+            for grant, student in grants]
+
+
+@router.post("/exams/{exam_id}/answer-access", status_code=201)
+def grant_answer_visibility(exam_id: str, data: AnswerVisibilityGrantIn, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    require(user, db, "results.read")
+    exam = db.get(Exam, exam_id)
+    if not exam:
+        raise HTTPException(404, "Examination not found")
+    if exam.status not in [ExamStatus.ended, ExamStatus.results_published, ExamStatus.archived]:
+        raise HTTPException(409, "Individual answer-sheet access can only be granted after the examination has ended")
+    student = db.query(User).filter(func.lower(User.email) == data.student_email.lower()).first()
+    if not student or student.role != Role.student or not student.active:
+        raise HTTPException(404, "An active student with that email was not found")
+    grant = db.query(AnswerVisibilityGrant).filter_by(exam_id=exam_id, student_id=student.id).first()
+    if not grant:
+        grant = AnswerVisibilityGrant(exam_id=exam_id, student_id=student.id, granted_by=user.id)
+        db.add(grant)
+        db.commit()
+    return {"granted": True, "student_id": student.id, "full_name": student.full_name, "email": student.email}
+
+
+@router.delete("/exams/{exam_id}/answer-access/{student_id}")
+def revoke_answer_visibility(exam_id: str, student_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    require(user, db, "results.read")
+    grant = db.query(AnswerVisibilityGrant).filter_by(exam_id=exam_id, student_id=student_id).first()
+    if not grant:
+        raise HTTPException(404, "Answer-sheet permission not found")
+    db.delete(grant); db.commit()
+    return {"revoked": True, "student_id": student_id}
+
+
+@router.get("/exams/{exam_id}/answer-sheet")
+def get_exam_answer_sheet(exam_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """Return a read-only answer sheet only to staff or explicitly permitted students."""
+    exam = db.get(Exam, exam_id)
+    if not exam:
+        raise HTTPException(404, "Examination not found")
+    _maybe_apply_scheduled_transition(exam, db)
+    if _exam_has_ended(exam):
+        _finalize_student_attempts(exam, db)
+    if user.role not in [Role.admin, Role.moderator] and not _student_can_view_unattempted_answer_sheet(db, exam, user):
+        raise HTTPException(403, "The answer sheet is not available to this account")
+    rows = db.query(Question).filter_by(exam_id=exam_id).order_by(Question.position, Question.id).all()
+    result = {"exam": exam_out(exam), "questions": [{**safe_question(question), "answer_key": question.answer_key or {}} for question in rows],
+              "read_only": True, "can_view_answers": True}
+    if user.role == Role.student:
+        participant_attempt = db.query(Attempt).filter_by(
+            exam_id=exam_id, student_id=user.id, is_admin_attempt=False, is_staff_attempt=False, status="submitted"
+        ).order_by(Attempt.submitted_at.desc()).first()
+        if participant_attempt:
+            result["participant_result"] = {"score": participant_attempt.score, "max_score": participant_attempt.max_score,
+                                             "submitted_at": _as_utc(participant_attempt.submitted_at).isoformat() if participant_attempt.submitted_at else None}
+    return result
+
+
 @router.post("/exams/{exam_id}/attempts")
 def start_attempt(exam_id:str,db:Session=Depends(get_db),user:User=Depends(current_user)):
-    if user.role!=Role.student: raise HTTPException(403,"Students only")
+    if user.role not in [Role.student, Role.moderator]: raise HTTPException(403,"Students and moderators may enter a live examination")
     e=db.get(Exam,exam_id)
+    _maybe_apply_scheduled_transition(e,db)
     if not e or e.status!=ExamStatus.live: raise HTTPException(409,"Exam is not live")
-    if e.access_mode=="selected_students" and not db.query(AccessGrant).filter_by(exam_id=exam_id,student_id=user.id,active=True).first(): raise HTTPException(403,"Access not granted")
-    count=db.query(Attempt).filter_by(exam_id=exam_id,student_id=user.id).count()
-    if count>=e.max_attempts: raise HTTPException(409,"Attempt limit reached")
-    a=Attempt(exam_id=exam_id,student_id=user.id,attempt_number=count+1,max_score=sum(q.marks for q in e.questions)); db.add(a); db.commit(); db.refresh(a)
-    return {"attempt_id":a.id,"started_at":a.started_at,"duration_seconds":e.duration_seconds,"remaining_seconds":e.duration_seconds,"exam_status":e.status.value,"server_time":datetime.now(timezone.utc).isoformat()}
+    if user.role == Role.student and e.access_mode=="selected_students" and not db.query(AccessGrant).filter_by(exam_id=exam_id,student_id=user.id,active=True).first(): raise HTTPException(403,"Access not granted")
+    count=db.query(Attempt).filter_by(exam_id=exam_id,student_id=user.id,is_admin_attempt=False).count()
+    if user.role == Role.student and count>=e.max_attempts: raise HTTPException(409,"Attempt limit reached")
+    a=Attempt(exam_id=exam_id,student_id=user.id,attempt_number=count+1,max_score=sum(q.marks for q in e.questions),pause_seconds_at_start=int(e.accumulated_pause_seconds or 0),is_staff_attempt=(user.role == Role.moderator)); db.add(a); db.commit(); db.refresh(a)
+    return {"attempt_id":a.id,"started_at":a.started_at,"duration_seconds":e.duration_seconds,"remaining_seconds":e.duration_seconds,"exam_status":e.status.value,"is_admin_attempt":False,"server_time":datetime.now(timezone.utc).isoformat()}
+
+
+@router.post("/exams/{exam_id}/admin-attempts")
+def start_admin_attempt(exam_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """Create/reuse an administrator-only exam preview attempt with answer-key visibility."""
+    if user.role != Role.admin:
+        raise HTTPException(403, "Administrator exam mode is available only to the site admin")
+    exam = db.get(Exam, exam_id)
+    if not exam:
+        raise HTTPException(404, "Examination not found")
+    _maybe_apply_scheduled_transition(exam, db)
+    existing = db.query(Attempt).filter_by(
+        exam_id=exam.id, student_id=user.id, is_admin_attempt=True, status="in_progress"
+    ).order_by(Attempt.attempt_number.desc()).first()
+    if existing:
+        return {"attempt_id": existing.id, "started_at": existing.started_at,
+                "duration_seconds": exam.duration_seconds, "remaining_seconds": _remaining_seconds(exam, existing) if exam.status in [ExamStatus.live, ExamStatus.paused] else exam.duration_seconds,
+                "exam_status": exam.status.value, "is_admin_attempt": True,
+                "server_time": datetime.now(timezone.utc).isoformat()}
+    count = db.query(Attempt).filter_by(exam_id=exam.id, student_id=user.id, is_admin_attempt=True).count()
+    started_at = _as_utc(exam.paused_at) if exam.status == ExamStatus.paused and exam.paused_at else datetime.now(timezone.utc)
+    attempt = Attempt(
+        exam_id=exam.id, student_id=user.id, attempt_number=count + 1,
+        status="in_progress", is_admin_attempt=True, is_staff_attempt=True, started_at=started_at,
+        pause_seconds_at_start=int(exam.accumulated_pause_seconds or 0),
+        max_score=sum(float(question.marks or 0) for question in exam.questions), answers=[],
+    )
+    db.add(attempt); db.commit(); db.refresh(attempt)
+    return {"attempt_id": attempt.id, "started_at": attempt.started_at,
+            "duration_seconds": exam.duration_seconds,
+            "remaining_seconds": _remaining_seconds(exam, attempt) if exam.status in [ExamStatus.live, ExamStatus.paused] else exam.duration_seconds,
+            "exam_status": exam.status.value, "is_admin_attempt": True,
+            "server_time": datetime.now(timezone.utc).isoformat()}
+
+@router.post("/attempts/{attempt_id}/visit/{question_id}")
+def mark_question_visited(attempt_id: str, question_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
+    attempt = db.get(Attempt, attempt_id)
+    if not attempt or attempt.student_id != user.id:
+        raise HTTPException(404, "Attempt not found")
+    if attempt.status != "in_progress":
+        return {"visited_question_ids": list(attempt.visited_question_ids or []), "saved": False}
+    question = db.query(Question).filter_by(id=question_id, exam_id=attempt.exam_id).first()
+    if not question:
+        raise HTTPException(404, "Question not found")
+    visited = list(attempt.visited_question_ids or [])
+    if question_id not in visited:
+        visited.append(question_id)
+        attempt.visited_question_ids = visited
+        db.commit()
+    return {"visited_question_ids": visited, "saved": True}
+
 
 @router.get("/attempts/{attempt_id}/questions")
 def attempt_questions(attempt_id:str,db:Session=Depends(get_db),user:User=Depends(current_user)):
     a=db.get(Attempt,attempt_id)
-    if not a or (a.student_id!=user.id and user.role==Role.student): raise HTTPException(404,"Attempt not found")
+    if not a or (a.student_id != user.id and user.role != Role.admin): raise HTTPException(404,"Attempt not found")
+    if a.is_admin_attempt and user.role != Role.admin: raise HTTPException(404,"Attempt not found")
     e=db.get(Exam,a.exam_id)
-    return [safe_question(q) for q in db.query(Question).filter_by(exam_id=e.id).order_by(Question.position, Question.id).all()]
+    _maybe_apply_scheduled_transition(e,db)
+    if e and e.status in [ExamStatus.ended, ExamStatus.results_published, ExamStatus.archived]:
+        _finalize_student_attempts(e, db)
+        db.refresh(a)
+    can_view_answers = user.role in [Role.admin, Role.moderator] or _student_can_view_attempt_answer_key(db, e, user, a)
+    rows = db.query(Question).filter_by(exam_id=e.id).order_by(Question.position, Question.id).all()
+    result = []
+    for question in rows:
+        payload = safe_question(question)
+        if can_view_answers:
+            payload["answer_key"] = question.answer_key or {}
+        result.append(payload)
+    return result
 
 @router.get("/attempts/{attempt_id}")
 def get_attempt(attempt_id:str,db:Session=Depends(get_db),user:User=Depends(current_user)):
     a=db.get(Attempt,attempt_id)
-    if not a or (a.student_id!=user.id and user.role==Role.student): raise HTTPException(404,"Attempt not found")
+    if not a or (a.student_id != user.id and user.role != Role.admin): raise HTTPException(404,"Attempt not found")
+    if a.is_admin_attempt and user.role != Role.admin: raise HTTPException(404,"Attempt not found")
     exam=db.get(Exam,a.exam_id)
-    return {"id":a.id,"exam_id":a.exam_id,"status":a.status,"exam_status":exam.status.value if exam else None,"answers":a.answers,"started_at":a.started_at,"submitted_at":a.submitted_at,"score":a.score,"remaining_seconds":_remaining_seconds(exam,a) if exam and a.status=="in_progress" and exam.status in [ExamStatus.live,ExamStatus.paused] else 0,"duration_seconds":exam.duration_seconds if exam else 0,"server_time":datetime.now(timezone.utc).isoformat()}
+    transitioned = _maybe_apply_scheduled_transition(exam,db)
+    if exam and exam.status in [ExamStatus.ended, ExamStatus.results_published, ExamStatus.archived]:
+        _finalize_student_attempts(exam, db)
+    if transitioned:
+        db.refresh(a)
+    timer_active = bool(exam and exam.status in [ExamStatus.live,ExamStatus.paused])
+    remaining = 0
+    if exam and a.status == "in_progress":
+        remaining = _remaining_seconds(exam,a) if timer_active else (int(exam.duration_seconds) if a.is_admin_attempt else 0)
+    can_view_answers = bool(exam and (user.role in [Role.admin, Role.moderator] or _student_can_view_attempt_answer_key(db, exam, user, a)))
+    return {"id":a.id,"exam_id":a.exam_id,"status":a.status,"exam_status":exam.status.value if exam else None,
+            "answers":a.answers,"visited_question_ids":list(a.visited_question_ids or []),"started_at":a.started_at,"submitted_at":a.submitted_at,"score":a.score,"max_score":a.max_score,
+            "can_view_answers":can_view_answers,"remaining_seconds":remaining,"duration_seconds":exam.duration_seconds if exam else 0,
+            "is_admin_attempt":bool(a.is_admin_attempt),"timer_active":timer_active,
+            "scheduled_resume_at":_as_utc(exam.scheduled_resume_at).isoformat() if exam and exam.scheduled_resume_at else None,
+            "server_time":datetime.now(timezone.utc).isoformat()}
 
 @router.put("/attempts/{attempt_id}/answers/{question_id}")
 def save_answer(attempt_id:str,question_id:str,data:AnswerIn,db:Session=Depends(get_db),user:User=Depends(current_user)):
     a=db.get(Attempt,attempt_id)
     if not a or a.student_id!=user.id: raise HTTPException(404,"Attempt not found")
+    if a.is_admin_attempt and user.role != Role.admin: raise HTTPException(404,"Attempt not found")
     if a.status!="in_progress": raise HTTPException(409,"Attempt is not active")
     e=db.get(Exam,a.exam_id)
-    if e.status!=ExamStatus.live: raise HTTPException(409,"Exam is not accepting answers")
-    if _remaining_seconds(e,a)<=0: raise HTTPException(409,"Time expired")
+    _maybe_apply_scheduled_transition(e,db)
+    if not a.is_admin_attempt:
+        if e.status!=ExamStatus.live: raise HTTPException(409,"Exam is not accepting answers")
+        if _remaining_seconds(e,a)<=0: raise HTTPException(409,"Time expired")
     q=db.query(Question).filter_by(id=question_id,exam_id=e.id).first()
     if not q: raise HTTPException(404,"Question not found")
     answers=list(a.answers or []); item=next((x for x in answers if x.get("question_id")==question_id),None)
     if item: item["answer"]=data.answer
     else: answers.append({"question_id":question_id,"answer":data.answer})
-    a.answers=answers; db.commit(); return {"saved":True}
+    a.answers=answers
+    visited=list(a.visited_question_ids or [])
+    if question_id not in visited:
+        visited.append(question_id)
+        a.visited_question_ids=visited
+    db.commit(); return {"saved":True,"visited_question_ids":visited,"is_admin_attempt":bool(a.is_admin_attempt)}
 
 def evaluate(q:Question,answer:dict):
     key=q.answer_key or {}
@@ -726,10 +1059,64 @@ def evaluate(q:Question,answer:dict):
         accepted=[str(x).strip().casefold() for x in key.get("accepted_answers",[])]; return str(answer.get("text","")).strip().casefold() in accepted
     return False
 
+
+
+def _finalize_student_attempts(exam: Exam, db: Session, now=None):
+    """Auto-submit ordinary participant attempts when an exam ends; staff previews stay separate."""
+    now = _as_utc(now or datetime.now(timezone.utc))
+    questions = db.query(Question).filter_by(exam_id=exam.id).all()
+    attempts = db.query(Attempt).filter_by(exam_id=exam.id, is_admin_attempt=False, status="in_progress").all()
+    changed = False
+    for attempt in attempts:
+        answer_map = {item.get("question_id"): item.get("answer", {}) for item in (attempt.answers or []) if isinstance(item, dict)}
+        score = 0.0
+        for question in questions:
+            answer = answer_map.get(question.id)
+            if answer is not None:
+                score += float(question.marks or 0) if evaluate(question, answer) else -float(question.negative_marks or 0)
+        attempt.score = max(0.0, score)
+        attempt.status = "submitted"
+        attempt.submitted_at = now
+        changed = True
+    if changed:
+        db.commit()
+
+
+def _exam_has_ended(exam: Exam | None) -> bool:
+    return bool(exam and exam.status in [ExamStatus.ended, ExamStatus.results_published, ExamStatus.archived])
+
+
+def _student_has_answer_grant(db: Session, exam_id: str, student_id: str) -> bool:
+    return db.query(AnswerVisibilityGrant).filter_by(exam_id=exam_id, student_id=student_id).first() is not None
+
+
+def _student_can_view_unattempted_answer_sheet(db: Session, exam: Exam, user: User) -> bool:
+    if user.role in [Role.admin, Role.moderator]:
+        return True
+    if user.role != Role.student or not _exam_has_ended(exam):
+        return False
+    if bool(exam.answers_public) or _student_has_answer_grant(db, exam.id, user.id):
+        return True
+    participated = db.query(Attempt).filter_by(
+        exam_id=exam.id, student_id=user.id, is_admin_attempt=False, is_staff_attempt=False, status="submitted"
+    ).first() is not None
+    return participated and not bool(exam.hide_participant_answers)
+
+
+def _student_can_view_attempt_answer_key(db: Session, exam: Exam, user: User, attempt: Attempt) -> bool:
+    if user.role in [Role.admin, Role.moderator]:
+        return True
+    if user.role != Role.student or not _exam_has_ended(exam):
+        return False
+    if bool(exam.answers_public) or _student_has_answer_grant(db, exam.id, user.id):
+        return True
+    return attempt.student_id == user.id and not bool(attempt.is_staff_attempt) and attempt.status == "submitted" and not bool(exam.hide_participant_answers)
+
 @router.post("/attempts/{attempt_id}/submit")
 def submit_attempt(attempt_id:str,db:Session=Depends(get_db),user:User=Depends(current_user)):
     a=db.get(Attempt,attempt_id)
     if not a or a.student_id!=user.id: raise HTTPException(404,"Attempt not found")
+    if a.is_admin_attempt and user.role != Role.admin: raise HTTPException(404,"Attempt not found")
     if a.status=="submitted": return {"score":a.score,"status":a.status}
     e=db.get(Exam,a.exam_id); answers={x["question_id"]:x["answer"] for x in (a.answers or [])}; score=0
     for q in e.questions:
@@ -795,7 +1182,7 @@ def _build_leaderboard_rows(db: Session, scope: str, exam_id: str | None = None,
     if exam_map:
         attempt_rows = db.query(Attempt, User, Exam).join(User, User.id == Attempt.student_id).join(Exam, Exam.id == Attempt.exam_id).filter(
             Attempt.exam_id.in_(list(exam_map.keys())),
-            Attempt.status == "submitted", User.active.is_(True), User.role == Role.student,
+            Attempt.status == "submitted", Attempt.is_admin_attempt.is_(False), Attempt.is_staff_attempt.is_(False), User.active.is_(True), User.role == Role.student,
         ).all()
     best_per_exam_student = {}
     question_cache = {}
@@ -1007,6 +1394,7 @@ def remove_admin_leaderboard_entry(data: LeaderboardRemoveIn, db: Session = Depe
 def publish_results(exam_id:str,db:Session=Depends(get_db),user:User=Depends(current_user)):
     require(user,db,"results.read"); e=db.get(Exam,exam_id)
     if not e or e.status!=ExamStatus.ended: raise HTTPException(409,"Exam must be ended")
+    _finalize_student_attempts(e, db)
     e.status=ExamStatus.results_published; db.commit(); return {"published":True}
 
 @router.post("/imports/pdf/preview")
