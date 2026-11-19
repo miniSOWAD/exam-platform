@@ -193,3 +193,23 @@ class LeaderboardRemoveIn(BaseModel):
         if self.scope == "subject" and not (self.subject or "").strip():
             raise ValueError("Subject is required")
         return self
+
+
+class StudentLeaderboardRow(BaseModel):
+    rank: int
+    student: str
+    score: float
+    max_score: float | None = None
+    accuracy: float | None = None
+
+
+class StudentLeaderboardExam(BaseModel):
+    id: str
+    title: str
+    subject: str
+
+
+class StudentLeaderboardCatalog(BaseModel):
+    exams: list[StudentLeaderboardExam]
+    papers: list[str]
+    subjects: list[str]

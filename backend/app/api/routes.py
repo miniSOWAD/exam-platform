@@ -9,6 +9,7 @@ from app.core.security import hash_password, verify_password, create_token, deco
 from app.core.config import settings
 from app.models.entities import User, Role, Exam, ExamStatus, Question, Attempt, AccessGrant, AnswerVisibilityGrant, PermissionGrant, HistoricalResult, SiteContent, LeaderboardEntry, LeaderboardExclusion
 from app.schemas.api import RegisterIn, LoginIn, UserOut, ExamIn, QuestionIn, AnswerIn, GrantIn, PermissionIn, PDFCreateExamIn, SiteContentUpdate, ScheduleUpdate, ExtendTimeIn, AnswerKeyApplyIn, DurationUpdate, CreateManagedUserIn, UserStatusUpdate, UserRoleUpdate, LeaderboardEntryCreate, LeaderboardRemoveIn, AnswerVisibilityUpdate, AnswerVisibilityGrantIn
+from app.schemas.api import StudentLeaderboardRow, StudentLeaderboardCatalog
 from app.services.pdf_exam_parser import parse_exam_pdf, OCRUnavailableError, OCRServiceError
 from app.services.answer_key_parser import extract_answer_key_file
 from app.services.cloudinary_images import InvalidProfileImage, validate_image_bytes, upload_image, delete_image
@@ -1215,7 +1216,7 @@ def _entry_matches_scope(entry: LeaderboardEntry, scope: str, exam_id: str | Non
     return (entry.subject or "").strip().casefold() == (subject or "").strip().casefold()
 
 
-def _build_leaderboard_rows(db: Session, scope: str, exam_id: str | None = None, paper: str | None = None, subject: str | None = None):
+def _build_leaderboard_rows(db: Session, scope: str, exam_id: str | None = None, paper: str | None = None, subject: str | None = None, *, published_attempts_only: bool = False):
     matching_exams = [exam for exam in db.query(Exam).all() if _leaderboard_scope_matches(scope, exam, exam_id, paper, subject)]
     exam_map = {exam.id: exam for exam in matching_exams}
     if scope == "exam" and exam_id not in exam_map:
@@ -1232,9 +1233,10 @@ def _build_leaderboard_rows(db: Session, scope: str, exam_id: str | None = None,
             excluded_ids.add(item.student_id)
 
     attempt_rows = []
-    if exam_map:
+    attempt_exam_ids = [exam.id for exam in matching_exams if not published_attempts_only or exam.status in _LEADERBOARD_PUBLISHED_STATUSES]
+    if attempt_exam_ids:
         attempt_rows = db.query(Attempt, User, Exam).join(User, User.id == Attempt.student_id).join(Exam, Exam.id == Attempt.exam_id).filter(
-            Attempt.exam_id.in_(list(exam_map.keys())),
+            Attempt.exam_id.in_(attempt_exam_ids),
             Attempt.status == "submitted", Attempt.is_admin_attempt.is_(False), Attempt.is_staff_attempt.is_(False), User.active.is_(True), User.role == Role.student,
         ).all()
     best_per_exam_student = {}
@@ -1344,13 +1346,74 @@ def _build_leaderboard_rows(db: Session, scope: str, exam_id: str | None = None,
     return rows
 
 
-@router.get("/exams/{exam_id}/leaderboard")
+_LEADERBOARD_PUBLISHED_STATUSES = (ExamStatus.results_published, ExamStatus.archived)
+
+
+def _student_leaderboard_rows(db: Session, scope: str, exam_id: str | None = None, paper: str | None = None, subject: str | None = None):
+    # Do not expose attempt scores until results have been published. Manual
+    # ranking records are intentionally visible as soon as staff save them.
+    rows = _build_leaderboard_rows(db, scope, exam_id=exam_id, paper=paper, subject=subject, published_attempts_only=True)
+    # Explicit allowlist, also enforced by the response model. Never return
+    # source, creator, account identifiers, timestamps or internal row IDs.
+    return [StudentLeaderboardRow(rank=row["rank"], student=row["student"], score=row["score"],
+                                  max_score=row["max_score"], accuracy=row["accuracy"]) for row in rows]
+
+
+@router.get("/leaderboards/catalog", response_model=StudentLeaderboardCatalog)
+def student_leaderboard_catalog(db: Session = Depends(get_db), user: User = Depends(current_user)):
+    manual_exam_ids = db.query(LeaderboardEntry.exam_id).filter(
+        LeaderboardEntry.scope == "exam", LeaderboardEntry.exam_id.is_not(None)
+    )
+    submitted_exam_ids = db.query(Attempt.exam_id).join(User, User.id == Attempt.student_id).filter(
+        Attempt.status == "submitted", Attempt.is_admin_attempt.is_(False), Attempt.is_staff_attempt.is_(False),
+        User.active.is_(True), User.role == Role.student,
+    )
+    exams = db.query(Exam).filter(or_(
+        Exam.id.in_(manual_exam_ids),
+        (Exam.status.in_(_LEADERBOARD_PUBLISHED_STATUSES)) & (Exam.id.in_(submitted_exam_ids)),
+    )).order_by(Exam.created_at.desc(), Exam.id).all()
+    # Exam-scoped manual records do not automatically contribute to other
+    # scopes: preserve the existing admin leaderboard aggregation semantics.
+    published_exams = [exam for exam in exams if exam.status in _LEADERBOARD_PUBLISHED_STATUSES]
+    subjects = {exam.subject.strip() for exam in published_exams if exam.subject and exam.subject.strip()}
+    papers = {paper for exam in published_exams if (paper := _exam_paper(exam))}
+    for entry in db.query(LeaderboardEntry).filter(LeaderboardEntry.scope.in_(["paper", "subject"])).all():
+        if entry.subject and entry.subject.strip():
+            subjects.add(entry.subject.strip())
+        if entry.scope == "paper" and entry.paper:
+            papers.add(entry.paper)
+    return {"exams": [{"id": exam.id, "title": exam.title, "subject": exam.subject} for exam in exams],
+            "papers": sorted(papers), "subjects": sorted(subjects, key=str.casefold)}
+
+
+@router.get("/exams/{exam_id}/leaderboard", response_model=list[StudentLeaderboardRow])
 def leaderboard(exam_id: str, db: Session = Depends(get_db), user: User = Depends(current_user)):
     exam = db.get(Exam, exam_id)
-    if not exam or exam.status not in [ExamStatus.results_published, ExamStatus.archived]:
-        raise HTTPException(403, "Results not published")
-    rows = _build_leaderboard_rows(db, "exam", exam_id=exam_id)
-    return [{"rank": row["rank"], "student": row["student"], "score": row["score"], "max_score": row["max_score"], "accuracy": row["accuracy"]} for row in rows]
+    if not exam:
+        raise HTTPException(404, "Examination not found")
+    if exam.status not in _LEADERBOARD_PUBLISHED_STATUSES and not db.query(LeaderboardEntry).filter_by(scope="exam", exam_id=exam_id).first():
+        raise HTTPException(403, "Rankings are not available for this examination yet")
+    return _student_leaderboard_rows(db, "exam", exam_id=exam_id)
+
+
+@router.get("/leaderboards", response_model=list[StudentLeaderboardRow])
+def student_leaderboards(scope: str = Query(default="exam"), exam_id: str | None = None,
+                         paper: str | None = None, subject: str | None = None,
+                         db: Session = Depends(get_db), user: User = Depends(current_user)):
+    if scope == "exam":
+        if not exam_id:
+            raise HTTPException(422, "Select an examination")
+        return leaderboard(exam_id, db, user)
+    if scope == "paper":
+        normalized_paper = _normalize_paper(paper)
+        if not normalized_paper:
+            raise HTTPException(422, "Select 1st Paper or 2nd Paper")
+        return _student_leaderboard_rows(db, scope, paper=normalized_paper, subject=subject)
+    if scope == "subject":
+        if not (subject or "").strip():
+            raise HTTPException(422, "Select a subject")
+        return _student_leaderboard_rows(db, scope, subject=subject)
+    raise HTTPException(422, "Scope must be exam, paper or subject")
 
 
 @router.get("/admin/leaderboards")

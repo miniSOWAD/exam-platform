@@ -53,7 +53,7 @@ export default function Header() {
             <Link href="/" className="nav-link">Home</Link>
             <a href="/#subjects" className="nav-link">Subjects</a>
             <a href="/#calendar" className="nav-link">Calendar</a>
-            <a href="/#leaderboard" className="nav-link">Leaderboard</a>
+            <Link href="/leaderboard" className="nav-link">Leaderboard</Link>
           </nav>
           <div className="flex items-center gap-2 sm:gap-3">
             {user ? (
@@ -65,6 +65,7 @@ export default function Header() {
                 {menuOpen && <div className="header-profile-popover">
                   <div className="header-popover-user"><strong>{user.full_name}</strong><span>{user.role}</span></div>
                   <Link href="/dashboard" onClick={() => setMenuOpen(false)}><LayoutDashboard size={15}/> {user.role === 'admin' ? 'Admin workspace' : 'My dashboard'}</Link>
+                  <Link href="/leaderboard" onClick={() => setMenuOpen(false)}>Leaderboard</Link>
                   <Link href="/dashboard/profile" onClick={() => setMenuOpen(false)}><UserRound size={15}/> My profile</Link>
                   {user.role === 'admin' && <Link href="/dashboard/site-content" onClick={() => setMenuOpen(false)}>Edit website content</Link>}
                   <button type="button" onClick={signOut}><LogOut size={15}/> Sign out</button>
