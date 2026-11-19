@@ -65,7 +65,7 @@ Existing attempt endpoints are extended:
 
 ## Database migration
 
-New Alembic revision: `0007_question_navigation_answer_visibility`
+New Alembic revision: `0007_qnav_visibility`
 
 It adds:
 
@@ -80,7 +80,7 @@ The migration is additive and preserves existing exams, attempts, answers, and a
 ## Deployment
 
 1. Back up the production database.
-2. Deploy the updated backend and confirm Alembic reaches `0007_question_navigation_answer_visibility`.
+2. Deploy the updated backend and confirm Alembic reaches `0007_qnav_visibility`.
 3. Deploy the updated frontend.
 4. Test a live exam with a student and a moderator.
 5. End a test exam and verify default participant answer access.

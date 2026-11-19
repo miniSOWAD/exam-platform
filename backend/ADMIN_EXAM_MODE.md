@@ -14,3 +14,7 @@ Deploy the backend and run `alembic upgrade head`. Migration `0006_admin_exam_mo
 
 ## Security
 Only `Role.admin` can create admin attempts, receive answer keys in attempt payloads, force-start, and reschedule live exams. Student APIs do not expose correct answers. Admin attempts are not included in student leaderboard calculations.
+
+## Restarting an ended examination
+
+The site administrator can restart an `ended` or `results_published` examination. Use `POST /exams/{exam_id}/control/force-start` for an immediate new run, or `PATCH /exams/{exam_id}/schedule` with a future `scheduled_start_at` to schedule a new run. Sending `scheduled_start_at: null` starts immediately. This is admin-only. A new `run_number` is created, previous attempts are retained, and student attempt limits apply separately to each run. See `ADMIN_ENDED_EXAM_RESTART.md`.

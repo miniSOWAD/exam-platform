@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "examflow-api"
+version = "1.3.3"
+description = "ExamFlow online examination platform API"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi[standard]",
+    "uvicorn[standard]==0.34.2",
+    "SQLAlchemy==2.0.40",
+    "alembic==1.15.2",
+    "psycopg[binary]==3.2.6",
+    "pydantic-settings==2.8.1",
+    "email-validator==2.2.0",
+    "python-multipart==0.0.20",
+    "passlib[argon2]==1.7.4",
+    "PyJWT==2.10.1",
+    "pymupdf==1.25.5",
+    "pytesseract==0.3.13",
+    "Pillow==11.1.0",
+    "cloudinary==1.44.1",
+    "httpx>=0.27,<1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app", "app.*"]
+exclude = ["tests", "tests.*"]
+
+[tool.fastapi]
+entrypoint = "app.main:app"

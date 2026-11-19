@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     # FastAPI Cloud deployments do not necessarily execute the project Dockerfile.
     # Run Alembic at ASGI startup so ORM columns and database schema stay in sync.
     auto_migrate: bool = Field(default=True, validation_alias=AliasChoices("AUTO_MIGRATE"))
+    enable_api_docs: bool = Field(default=True, validation_alias=AliasChoices("ENABLE_API_DOCS"))
     secret_key: str = Field(
         default="CHANGE-ME-IN-PRODUCTION-USE-A-LONG-RANDOM-SECRET",
         validation_alias=AliasChoices("JWT_SECRET", "SECRET_KEY"),

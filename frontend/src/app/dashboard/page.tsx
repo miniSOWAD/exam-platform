@@ -247,6 +247,7 @@ export default function Dashboard() {
               <Link href={`/dashboard/exams/${exam.id}/schedule`} className="text-sm font-bold text-teal-700">Schedule & timing</Link>
               {exam.status === 'draft' && <button onClick={() => publishExam(exam.id)} className="text-sm font-bold text-emerald-700">Publish exam</button>}
               {exam.status === 'published' && <button onClick={() => controlExam(exam.id, 'start')} className="text-sm font-bold text-emerald-700"><Play className="mr-1 inline" size={13}/>Start</button>}
+              {user.role === 'admin' && ['ended', 'results_published'].includes(exam.status) && <button onClick={() => controlExam(exam.id, 'force-start')} className="text-sm font-bold text-emerald-700"><Play className="mr-1 inline" size={13}/>Start new run</button>}
               {exam.status === 'live' && <button onClick={() => controlExam(exam.id, 'pause')} className="text-sm font-bold text-amber-700"><Pause className="mr-1 inline" size={13}/>Pause</button>}
               {exam.status === 'paused' && <button onClick={() => controlExam(exam.id, 'resume')} className="text-sm font-bold text-emerald-700"><RotateCcw className="mr-1 inline" size={13}/>Resume</button>}
               {['live', 'paused'].includes(exam.status) && <button onClick={() => controlExam(exam.id, 'end')} className="text-sm font-bold text-red-700"><Square className="mr-1 inline" size={12}/>End</button>}

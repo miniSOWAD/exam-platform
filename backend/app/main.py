@@ -34,7 +34,11 @@ def upgrade_database_schema() -> None:
     alembic_config = Config(str(BACKEND_ROOT / "alembic.ini"))
     alembic_config.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
     logger.info("Checking database schema and applying pending ExamFlow migrations...")
-    command.upgrade(alembic_config, "head")
+    try:
+        command.upgrade(alembic_config, "head")
+    except Exception:
+        logger.exception("Database migration failed. FastAPI startup is being stopped; inspect the last 0007/0008 migration step above and verify DATABASE_URL and database permissions.")
+        raise
     logger.info("Database schema is up to date (Alembic head).")
 
 
@@ -51,7 +55,8 @@ app = FastAPI(
     title=settings.app_name,
     version="1.3.2",
     description="Online examination platform API",
-    docs_url="/docs" if settings.environment != "production" else None,
+    docs_url="/docs" if settings.enable_api_docs else None,
+    openapi_url="/openapi.json" if settings.enable_api_docs else None,
     redoc_url=None,
     lifespan=lifespan,
 )
@@ -63,3 +68,15 @@ app.add_middleware(
     allow_headers=["Content-Type", "X-CSRF-Token"],
 )
 app.include_router(router, prefix="/api/v1")
+
+
+@app.get("/", include_in_schema=False)
+def service_root():
+    """FastAPI Cloud's advertised service root; avoids a misleading root 404."""
+    return {"service": "ExamFlow API", "status": "ok", "health": "/health", "api": "/api/v1", "docs": "/docs" if settings.enable_api_docs else None}
+
+
+@app.get("/health", include_in_schema=False)
+def service_health():
+    """Liveness endpoint for hosting-platform health checks."""
+    return {"status": "ok", "service": "examflow-api"}

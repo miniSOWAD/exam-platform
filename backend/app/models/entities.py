@@ -48,6 +48,9 @@ class Exam(Base):
     status: Mapped[ExamStatus]=mapped_column(Enum(ExamStatus), default=ExamStatus.draft, index=True)
     access_mode: Mapped[str]=mapped_column(String(30), default="all_students")
     duration_seconds: Mapped[int]=mapped_column(Integer, default=3600)
+    # Incremented whenever an administrator restarts an ended examination.
+    # Historical attempts remain attached to their original run.
+    run_number: Mapped[int]=mapped_column(Integer, default=1, nullable=False)
     max_attempts: Mapped[int]=mapped_column(Integer, default=1)
     pass_marks: Mapped[float]=mapped_column(Float, default=0)
     started_at: Mapped[datetime|None]=mapped_column(DateTime(timezone=True), nullable=True)
@@ -102,6 +105,7 @@ class Attempt(Base):
     exam_id: Mapped[str]=mapped_column(ForeignKey("exams.id"), index=True)
     student_id: Mapped[str]=mapped_column(ForeignKey("users.id"), index=True)
     attempt_number: Mapped[int]=mapped_column(Integer, default=1)
+    run_number: Mapped[int]=mapped_column(Integer, default=1, nullable=False)
     status: Mapped[str]=mapped_column(String(30), default="in_progress", index=True)
     is_admin_attempt: Mapped[bool]=mapped_column(Boolean, default=False, nullable=False)
     is_staff_attempt: Mapped[bool]=mapped_column(Boolean, default=False, nullable=False)

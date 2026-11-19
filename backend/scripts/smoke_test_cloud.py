@@ -41,7 +41,7 @@ def main() -> int:
     failures = 0
 
     with httpx.Client(base_url=base, timeout=60, follow_redirects=True) as client:
-        for path in ("/api/v1/health", "/api/v1/site/content", "/api/v1/public/exams"):
+        for path in ("/", "/health", "/api/v1/health", "/docs", "/api/v1/site/content", "/api/v1/public/exams"):
             if not check(client, "GET", path):
                 failures += 1
 

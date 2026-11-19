@@ -410,7 +410,7 @@ def create_exam(data:ExamIn,db:Session=Depends(get_db),user:User=Depends(current
     exam=Exam(**values,created_by=user.id); db.add(exam); db.commit(); db.refresh(exam); return exam_out(exam)
 
 def exam_out(e):
-    return {"id":e.id,"title":e.title,"description":e.description,"subject":e.subject,"status":e.status.value,"access_mode":e.access_mode,"duration_seconds":e.duration_seconds,"max_attempts":e.max_attempts,"pass_marks":e.pass_marks,"chapter":e.chapter,"set_name":e.set_name,"paper":e.paper,"declared_question_count":e.declared_question_count,"source_file_name":e.source_file_name,"scheduled_start_at":_as_utc(e.scheduled_start_at).isoformat() if e.scheduled_start_at else None,"scheduled_end_at":_as_utc(e.scheduled_end_at).isoformat() if e.scheduled_end_at else None,"scheduled_resume_at":_as_utc(e.scheduled_resume_at).isoformat() if e.scheduled_resume_at else None,"time_extension_seconds":e.time_extension_seconds or 0,"answers_public":bool(e.answers_public),"hide_participant_answers":bool(e.hide_participant_answers),"question_count":len(e.questions)}
+    return {"id":e.id,"title":e.title,"description":e.description,"subject":e.subject,"status":e.status.value,"access_mode":e.access_mode,"duration_seconds":e.duration_seconds,"run_number":int(getattr(e,"run_number",1) or 1),"max_attempts":e.max_attempts,"pass_marks":e.pass_marks,"chapter":e.chapter,"set_name":e.set_name,"paper":e.paper,"declared_question_count":e.declared_question_count,"source_file_name":e.source_file_name,"scheduled_start_at":_as_utc(e.scheduled_start_at).isoformat() if e.scheduled_start_at else None,"scheduled_end_at":_as_utc(e.scheduled_end_at).isoformat() if e.scheduled_end_at else None,"scheduled_resume_at":_as_utc(e.scheduled_resume_at).isoformat() if e.scheduled_resume_at else None,"time_extension_seconds":e.time_extension_seconds or 0,"answers_public":bool(e.answers_public),"hide_participant_answers":bool(e.hide_participant_answers),"question_count":len(e.questions)}
 
 @router.get("/public/exams")
 def public_exams(db:Session=Depends(get_db)):
@@ -672,21 +672,38 @@ def control_exam(exam_id:str,action:str,db:Session=Depends(get_db),user:User=Dep
             raise HTTPException(403, "Only the site admin can force-start an examination")
         exam=db.query(Exam).filter(Exam.id==exam_id).with_for_update().first()
         if not exam: raise HTTPException(404,"Exam not found")
-        if exam.status not in [ExamStatus.draft, ExamStatus.published, ExamStatus.paused]:
+        restart_from_ended = exam.status in [ExamStatus.ended, ExamStatus.results_published]
+        if exam.status not in [ExamStatus.draft, ExamStatus.published, ExamStatus.paused, ExamStatus.ended, ExamStatus.results_published]:
             raise HTTPException(409, f"Cannot start an examination in {exam.status.value} state")
         now=datetime.now(timezone.utc)
         was_paused = exam.status == ExamStatus.paused
-        if was_paused and exam.paused_at:
+        if restart_from_ended:
+            # Start a fresh sitting without deleting the previous run's attempts/results.
+            # Attempt limits are evaluated within the current run_number.
+            _finalize_student_attempts(exam, db, now=now, commit=False)
+            previous_run = int(getattr(exam, "run_number", 1) or 1)
+            db.query(Attempt).filter_by(
+                exam_id=exam.id, run_number=previous_run, is_admin_attempt=True, status="in_progress"
+            ).update({Attempt.status: "submitted", Attempt.submitted_at: now}, synchronize_session=False)
+            exam.run_number = previous_run + 1
+            exam.accumulated_pause_seconds = 0
+            exam.started_at = now
+            exam.ended_at = None
+            exam.scheduled_start_at = now
+            if exam.scheduled_end_at and _as_utc(exam.scheduled_end_at) <= now:
+                exam.scheduled_end_at = None
+        elif was_paused and exam.paused_at:
             exam.accumulated_pause_seconds = int(exam.accumulated_pause_seconds or 0) + max(
                 0, int((now - _as_utc(exam.paused_at)).total_seconds())
             )
         exam.status=ExamStatus.live
         exam.started_at=exam.started_at or now
+        exam.ended_at=None
         exam.paused_at=None
         exam.scheduled_resume_at=None
         # If the admin was previewing a draft/upcoming exam, start that preview
         # clock now rather than charging time spent in preview mode.
-        if not was_paused:
+        if not was_paused and not restart_from_ended:
             db.query(Attempt).filter_by(exam_id=exam.id, is_admin_attempt=True, status="in_progress").update(
                 {Attempt.started_at: now, Attempt.pause_seconds_at_start: int(exam.accumulated_pause_seconds or 0)}, synchronize_session=False
             )
@@ -724,6 +741,40 @@ def update_exam_schedule(exam_id:str,data:ScheduleUpdate,db:Session=Depends(get_
     updates=data.model_dump(exclude_unset=True)
     now=datetime.now(timezone.utc)
     is_admin = user.role == Role.admin
+
+    # An ended/results-published exam can be scheduled again only by the site
+    # administrator. This creates a new run while preserving all old attempts.
+    if exam.status in [ExamStatus.ended, ExamStatus.results_published]:
+        if not is_admin:
+            raise HTTPException(403,"Only the site admin can reschedule an ended examination")
+        if "scheduled_start_at" not in updates:
+            raise HTTPException(422,"Provide scheduled_start_at (use null to start the new run immediately)")
+        requested_start = _as_utc(updates.get("scheduled_start_at"))
+        start = requested_start if requested_start and requested_start > now else now
+        end = _as_utc(updates.get("scheduled_end_at")) if "scheduled_end_at" in updates else None
+        if end and end <= now:
+            raise HTTPException(422,"The scheduled end must be in the future")
+        if end and end <= start:
+            raise HTTPException(422,"Scheduled end must be after the new run start")
+
+        previous_run = int(getattr(exam, "run_number", 1) or 1)
+        _finalize_student_attempts(exam, db, now=now, commit=False)
+        db.query(Attempt).filter_by(
+            exam_id=exam.id, run_number=previous_run, is_admin_attempt=True, status="in_progress"
+        ).update({Attempt.status: "submitted", Attempt.submitted_at: now}, synchronize_session=False)
+        exam.run_number = previous_run + 1
+        exam.started_at = None if start > now else now
+        exam.ended_at = None
+        exam.paused_at = None
+        exam.accumulated_pause_seconds = 0
+        exam.scheduled_start_at = start
+        exam.scheduled_end_at = end
+        exam.scheduled_resume_at = None
+        exam.status = ExamStatus.published if start > now else ExamStatus.live
+        db.commit(); db.refresh(exam)
+        return {**exam_out(exam), "new_run_created": True,
+                "message": (f"A new run has been scheduled for {start.isoformat()}. Previous attempts have been preserved." if start > now
+                            else "The ended examination has been restarted immediately as a new run. Previous attempts have been preserved.")}
 
     if exam.status in [ExamStatus.live, ExamStatus.paused]:
         if not is_admin:
@@ -928,9 +979,10 @@ def start_attempt(exam_id:str,db:Session=Depends(get_db),user:User=Depends(curre
     _maybe_apply_scheduled_transition(e,db)
     if not e or e.status!=ExamStatus.live: raise HTTPException(409,"Exam is not live")
     if user.role == Role.student and e.access_mode=="selected_students" and not db.query(AccessGrant).filter_by(exam_id=exam_id,student_id=user.id,active=True).first(): raise HTTPException(403,"Access not granted")
-    count=db.query(Attempt).filter_by(exam_id=exam_id,student_id=user.id,is_admin_attempt=False).count()
-    if user.role == Role.student and count>=e.max_attempts: raise HTTPException(409,"Attempt limit reached")
-    a=Attempt(exam_id=exam_id,student_id=user.id,attempt_number=count+1,max_score=sum(q.marks for q in e.questions),pause_seconds_at_start=int(e.accumulated_pause_seconds or 0),is_staff_attempt=(user.role == Role.moderator)); db.add(a); db.commit(); db.refresh(a)
+    total_count=db.query(Attempt).filter_by(exam_id=exam_id,student_id=user.id,is_admin_attempt=False).count()
+    run_count=db.query(Attempt).filter_by(exam_id=exam_id,student_id=user.id,is_admin_attempt=False,run_number=int(getattr(e,"run_number",1) or 1)).count()
+    if user.role == Role.student and run_count>=e.max_attempts: raise HTTPException(409,"Attempt limit reached for this examination run")
+    a=Attempt(exam_id=exam_id,student_id=user.id,attempt_number=total_count+1,run_number=int(getattr(e,"run_number",1) or 1),max_score=sum(q.marks for q in e.questions),pause_seconds_at_start=int(e.accumulated_pause_seconds or 0),is_staff_attempt=(user.role == Role.moderator)); db.add(a); db.commit(); db.refresh(a)
     return {"attempt_id":a.id,"started_at":a.started_at,"duration_seconds":e.duration_seconds,"remaining_seconds":e.duration_seconds,"exam_status":e.status.value,"is_admin_attempt":False,"server_time":datetime.now(timezone.utc).isoformat()}
 
 
@@ -944,7 +996,7 @@ def start_admin_attempt(exam_id: str, db: Session = Depends(get_db), user: User 
         raise HTTPException(404, "Examination not found")
     _maybe_apply_scheduled_transition(exam, db)
     existing = db.query(Attempt).filter_by(
-        exam_id=exam.id, student_id=user.id, is_admin_attempt=True, status="in_progress"
+        exam_id=exam.id, student_id=user.id, is_admin_attempt=True, run_number=int(getattr(exam,"run_number",1) or 1), status="in_progress"
     ).order_by(Attempt.attempt_number.desc()).first()
     if existing:
         return {"attempt_id": existing.id, "started_at": existing.started_at,
@@ -955,6 +1007,7 @@ def start_admin_attempt(exam_id: str, db: Session = Depends(get_db), user: User 
     started_at = _as_utc(exam.paused_at) if exam.status == ExamStatus.paused and exam.paused_at else datetime.now(timezone.utc)
     attempt = Attempt(
         exam_id=exam.id, student_id=user.id, attempt_number=count + 1,
+        run_number=int(getattr(exam,"run_number",1) or 1),
         status="in_progress", is_admin_attempt=True, is_staff_attempt=True, started_at=started_at,
         pause_seconds_at_start=int(exam.accumulated_pause_seconds or 0),
         max_score=sum(float(question.marks or 0) for question in exam.questions), answers=[],
@@ -1061,7 +1114,7 @@ def evaluate(q:Question,answer:dict):
 
 
 
-def _finalize_student_attempts(exam: Exam, db: Session, now=None):
+def _finalize_student_attempts(exam: Exam, db: Session, now=None, commit: bool = True):
     """Auto-submit ordinary participant attempts when an exam ends; staff previews stay separate."""
     now = _as_utc(now or datetime.now(timezone.utc))
     questions = db.query(Question).filter_by(exam_id=exam.id).all()
@@ -1078,7 +1131,7 @@ def _finalize_student_attempts(exam: Exam, db: Session, now=None):
         attempt.status = "submitted"
         attempt.submitted_at = now
         changed = True
-    if changed:
+    if changed and commit:
         db.commit()
 
 
